@@ -1,0 +1,82 @@
+# File: esphome/packages/victron_ble.yaml
+# Purpose: SmartSolar MPPT via Fabian‑Schmidt victron_ble component (VENDORED copy)
+# Usage:
+#   1) Ensure this file is placed in your repo at:
+#         esphome/packages/victron_ble.yaml
+#   2) Ensure the component source code from Fabian‑Schmidt is vendored into:
+#         esphome/components/victron_ble/*
+#         (structure as in the upstream repo).
+#   3) Enable BLE scanning in the ROOT yaml (not here):
+#         esp32_ble_tracker:
+#   4) Put credentials in secrets.yaml:
+#         victron_smartsolar_mac: "mac"
+#         victron_smartsolar_bindkey: "bindkey"
+#   5) Include this package from the root yaml:
+#         packages:
+#           victron_ble: !include packages/victron_ble.yaml
+#   6) While commissioning, don't keep VictronConnect actively connected —
+#      advertising stops during a connection.
+# Source: https://github.com/Fabian-Schmidt/esphome-victron_ble
+
+victron_ble:
+  - id: smartsolar
+    mac_address: !secret victron_smartsolar_mac
+    bindkey: !secret victron_smartsolar_bindkey
+
+# ------ SmartSolar sensors  ------
+sensor:
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Battery Voltage"
+    type: BATTERY_VOLTAGE
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Battery Current"
+    type: BATTERY_CURRENT
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT PV Power"
+    type: PV_POWER
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Yield Today"
+    type: YIELD_TODAY
+    # Optional filters to reduce HA traffic and mark stale data
+    filters:
+      - throttle_average: 60s
+      - timeout: 180s
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Load Current"
+    type: LOAD_CURRENT
+
+# Fault & state indicators
+binary_sensor:
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Fault State"
+    type: DEVICE_STATE_FAULT
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Error State"
+    type: CHARGER_ERROR
+
+text_sensor:
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Charger State"
+    type: DEVICE_STATE
+
+  - platform: victron_ble
+    victron_ble_id: smartsolar
+    name: "MPPT Error Reason"
+    type: CHARGER_ERROR
+# Notes:
+# - You can add/remove metrics based on the upstream README tables.
+# - If values seem missing, verify they’re visible on the Victron app overview
+#   BEFORE connecting (only advertising data is exposed).

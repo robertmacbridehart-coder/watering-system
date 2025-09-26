@@ -1,0 +1,30 @@
+# -----------------------------
+# File: esphome/packages/inputs.yaml
+# Purpose: Local GPIO sensors (tank level relays) with debouncing
+# -----------------------------
+
+binary_sensor:
+  # -------------------- Low Water Level Alarms --------------------
+  - platform: gpio
+    pin:
+      number: GPIO33
+      mode: INPUT_PULLUP # Wiring - NO to GPIO, COM to GND
+      inverted: true
+    id: low_water_level
+    name: "Low Water Level"
+    device_class: problem
+    filters:
+      - delayed_off: 30s
+      - debounce: 100ms
+
+  - platform: gpio
+    pin:
+      number: GPIO32
+      mode: INPUT_PULLUP
+      inverted: true
+    id: low_low_water_level
+    name: "Low Low Water Level"
+    device_class: problem
+    filters:
+      - delayed_off: 30s
+      - debounce: 100ms

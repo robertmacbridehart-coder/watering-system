@@ -1,0 +1,244 @@
+# ---- Bright Sky via direct REST sensors (no attributes) ----
+# Docs: https://brightsky.dev/docs/  (/current_weather, /weather)
+# Coords ~ August-Horch-Str 3A, 80999 München
+
+# Bright Sky REST sensors with unique_id
+# Paste into your packages file or inline under `sensor:` in configuration.yaml
+
+sensor:
+  # --- current conditions (/current_weather) ---
+  - platform: rest
+    name: brightsky_temperature
+    unique_id: brightsky_temperature_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.temperature | float(0)}}
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_humidity
+    unique_id: brightsky_humidity_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.relative_humidity | float(0)}}
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_pressure
+    unique_id: brightsky_pressure_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.pressure_msl | float(0)}}
+    unit_of_measurement: "hPa"
+    device_class: pressure
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_dew_point
+    unique_id: brightsky_dew_point_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.dew_point | float(0)}}
+    unit_of_measurement: "°C"
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_cloud_cover
+    unique_id: brightsky_cloud_cover_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.cloud_cover | float(0)}}
+    unit_of_measurement: "%"
+    state_class: measurement
+
+  # last-hour values (use *_60 fields from /current_weather)
+  - platform: rest
+    name: brightsky_rain_now
+    unique_id: brightsky_rain_60_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.precipitation_60 | float(0)}}
+    unit_of_measurement: "mm"
+    device_class: precipitation
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_sunshine
+    unique_id: brightsky_sunshine_60_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.sunshine_60 | float(0)}}
+    unit_of_measurement: "min"
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_wind_speed
+    unique_id: brightsky_wind_speed_60_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.wind_speed_60 | float(0)}}
+    unit_of_measurement: "m/s"
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_wind_gust
+    unique_id: brightsky_wind_gust_60_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{w.wind_gust_speed_60 | float(0)}}
+    unit_of_measurement: "m/s"
+    state_class: measurement
+
+  - platform: rest
+    name: brightsky_wind_direction
+    unique_id: brightsky_wind_direction_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 300
+    timeout: 20
+    value_template: >
+      {% set w = value_json.weather | default({}, true) %}
+      {{((w.wind_direction_60 | default(None)) or (w.wind_direction_30 | default(None)) or (w.wind_direction_10 | default(0))) | float(0)}}
+    unit_of_measurement: "°"
+
+  - platform: rest
+    name: brightsky_station_name
+    unique_id: brightsky_station_name_now
+    resource_template: >
+      https://api.brightsky.dev/current_weather?lat={{state_attr('zone.home','latitude')}}&lon={{state_attr('zone.home','longitude')}}&tz=Europe/Berlin
+    scan_interval: 900
+    timeout: 20
+    value_template: >
+      {% set src = value_json.sources | default([], true) %}
+      {% if src and 'station_name' in src[0] %}
+        {{src[0]['station_name']}}
+      {% else %}unknown{% endif %}
+
+  # 24 h rain total ending at the current hour
+  - platform: rest
+    name: brightsky_rain_24h
+    unique_id: brightsky_rain_24h_total
+    resource_template: >-
+      {{'https://api.brightsky.dev/weather'
+         ~ '?lat=' ~ state_attr('zone.home','latitude')
+         ~ '&lon=' ~ state_attr('zone.home','longitude')
+         ~ '&date=' ~ (now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)).isoformat()
+         ~ '&last_date=' ~ now().replace(minute=0, second=0, microsecond=0).isoformat()
+         ~ '&tz=Europe/Berlin'}}
+    scan_interval: 600
+    timeout: 20
+    value_template: >-
+      {% set rows = value_json.weather | default([], true) %}
+      {% if not rows %}0{% else %}
+        {% set now_hour = as_timestamp(now().replace(minute=0, second=0, microsecond=0)) %}
+        {% set window_start = now_hour - 24*3600 %}
+        {% set ns = namespace(total=0.0) %}
+        {% for r in rows if 'timestamp' in r %}
+          {% set ts = as_timestamp(r['timestamp']) %}
+          {% if ts <= now_hour and ts > window_start %}
+            {% set ns.total = ns.total + (r['precipitation'] | float(0)) %}
+          {% endif %}
+        {% endfor %}
+        {{ns.total | round(2)}}
+      {% endif %}
+    unit_of_measurement: "mm"
+    device_class: precipitation
+    state_class: total
+
+  # 72 h rain total ending at the current hour
+  - platform: rest
+    name: brightsky_rain_72h
+    unique_id: brightsky_rain_72h_total
+    resource_template: >-
+      {{'https://api.brightsky.dev/weather'
+         ~ '?lat=' ~ state_attr('zone.home','latitude')
+         ~ '&lon=' ~ state_attr('zone.home','longitude')
+         ~ '&date=' ~ (now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=72)).isoformat()
+         ~ '&last_date=' ~ now().replace(minute=0, second=0, microsecond=0).isoformat()
+         ~ '&tz=Europe/Berlin'}}
+    scan_interval: 900
+    timeout: 20
+    value_template: >-
+      {% set rows = value_json.weather | default([], true) %}
+      {% if not rows %}0{% else %}
+        {% set now_hour = as_timestamp(now().replace(minute=0, second=0, microsecond=0)) %}
+        {% set window_start = now_hour - 72*3600 %}
+        {% set ns = namespace(total=0.0) %}
+        {% for r in rows if 'timestamp' in r %}
+          {% set ts = as_timestamp(r['timestamp']) %}
+          {% if ts <= now_hour and ts > window_start %}
+            {% set ns.total = ns.total + (r['precipitation'] | float(0)) %}
+          {% endif %}
+        {% endfor %}
+        {{ns.total | round(2)}}
+      {% endif %}
+    unit_of_measurement: "mm"
+    device_class: precipitation
+    state_class: total
+
+template:
+  - sensor:
+      - name: brightsky_wind_speed_knots
+        unique_id: brightsky_wind_speed_knots
+        unit_of_measurement: "kn"
+        state_class: measurement
+        state: >
+          {% set mps = states('sensor.brightsky_wind_speed') | float(0) %}
+          {{(mps * 1.94384) | round(1)}}
+
+      - name: brightsky_weather_url_24h
+        state: >-
+          {{'https://api.brightsky.dev/weather?lat=' ~ state_attr('zone.home','latitude')
+             ~ '&lon=' ~ state_attr('zone.home','longitude')
+             ~ '&date=' ~ (now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=24)).isoformat()
+             ~ '&last_date=' ~ now().replace(minute=0, second=0, microsecond=0).isoformat()
+             ~ '&tz=Europe/Berlin'}}
+
+  - binary_sensor:
+      - name: brightsky_raining_now
+        unique_id: brightsky_raining_now_bool
+        device_class: moisture
+        state: "{{states('sensor.brightsky_rain_now') | float(0) > 0.0}}"
+      - name: brightsky_sunny_now
+        unique_id: brightsky_sunny_now_bool
+        state: "{{states('sensor.brightsky_sunshine') | float(0) >= 30}}"

@@ -1,0 +1,55 @@
+esphome:
+  name: watering-system
+  friendly_name: Watering System
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret esphome_api_key
+
+ota:
+  - platform: esphome
+    password: !secret esphome_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Watering-System Fallback Hotspot"
+    password: !secret wifi_ap_password
+
+captive_portal:
+
+esp32_ble_tracker:
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+
+packages:
+  modbus_rs485: !include packages/modbus_rs485.yaml
+  # RS485 System (bus, controller, relay board, fert pumps, sensors)
+  inputs: !include packages/inputs.yaml
+  # Local GPIO inputs on ESP board
+  victron_ble: !include packages/victron_ble.yaml
+  # BLE inputs from solar controller
+
+text_sensor:
+  - platform: template
+    name: "WS Build Info"
+    icon: mdi:information
+    lambda: |-
+      static char buf[40];
+      snprintf(buf, sizeof(buf), "Built %s %s", __DATE__, __TIME__);
+      return {buf};

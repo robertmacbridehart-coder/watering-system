@@ -1,0 +1,413 @@
+# -------------------- UART + Modbus Settings --------------------
+uart:
+  id: modbus_uart
+  tx_pin: GPIO25 # your current wiring
+  rx_pin: GPIO26
+  baud_rate: 9600
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE # keep to NONE unless your device says otherwise
+  rx_buffer_size: 512 # bigger buffer for bursts / retries
+
+modbus:
+  id: modbus1
+  uart_id: modbus_uart
+  send_wait_time: 8ms # small pause helps stability
+
+# -------------------- Modbus Relay Board (RAW coils) --------------------
+# NOTE: These raw switches are NOT exposed to HA. The template wrappers below are.
+modbus_controller:
+  - id: relay_board
+    address: 0x01
+    modbus_id: modbus1
+    command_throttle: 100ms
+
+switch:
+  # RAW coils: 1..16 (addresses 0..15)
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_1_raw
+    register_type: coil
+    address: 0
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_2_raw
+    register_type: coil
+    address: 1
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_3_raw
+    register_type: coil
+    address: 2
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_4_raw
+    register_type: coil
+    address: 3
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_5_raw
+    register_type: coil
+    address: 4
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_6_raw
+    register_type: coil
+    address: 5
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_7_raw
+    register_type: coil
+    address: 6
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_8_raw
+    register_type: coil
+    address: 7
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_9_raw
+    register_type: coil
+    address: 8
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  # 24V enable coil (relay_10 on the Modbus board)
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_10 # referenced by scripts below
+    register_type: coil
+    address: 9
+    icon: mdi:power
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_11_raw
+    register_type: coil
+    address: 10
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_12_raw
+    register_type: coil
+    address: 11
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_13_raw
+    register_type: coil
+    address: 12
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_14_raw
+    register_type: coil
+    address: 13
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_15_raw
+    register_type: coil
+    address: 14
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_16_raw
+    register_type: coil
+    address: 15
+    icon: mdi:valve
+    restore_mode: ALWAYS_OFF
+
+# -------------------- 24V state mirror --------------------
+binary_sensor:
+  - platform: template
+    id: v24_active
+    internal: true
+    lambda: |-
+      return id(relay_10).state;
+
+# -------------------- Helper scripts (guard 24V around Modbus traffic) --------------------
+script:
+  # Ensure 24 V is ON before any Modbus frame; refresh the post-traffic off timer
+  - id: v24_ensure_on
+    mode: restart
+    then:
+      - if:
+          condition:
+            binary_sensor.is_off: v24_active
+          then:
+            - switch.turn_on: relay_10
+            - delay: 300ms # let 24 V rail/converter settle
+      - script.execute: v24_off_delay
+
+  # Turn 24 V off a short time after the last command
+  - id: v24_off_delay
+    mode: restart
+    then:
+      - delay: 60s # extend if you chain multiple actions
+      - switch.turn_off: relay_10
+
+  # Safe ON wrapper for a raw Modbus coil
+  - id: set_coil_on_safe
+    parameters:
+      target_id: string
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - lambda: |-
+          (id(${target_id})).turn_on();
+      - script.execute: v24_off_delay
+
+  # Safe OFF wrapper for a raw Modbus coil
+  - id: set_coil_off_safe
+    parameters:
+      target_id: string
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - lambda: |-
+          (id(${target_id})).turn_off();
+      - script.execute: v24_off_delay
+
+  # -------------------- User-facing wrapper switches (keep your names) --------------------
+  # Each wrapper: turns target ON, schedules 120min auto-OFF through the same safe path.
+  - platform: template
+    name: "Pump_01"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_1_raw).state;
+    turn_on_action:
+      - script.execute:
+          id: set_coil_on_safe
+          target_id: "relay_1_raw"
+      - delay: 120min
+      - script.execute:
+          id: set_coil_off_safe
+          target_id: "relay_1_raw"
+    turn_off_action:
+      - script.execute:
+          id: set_coil_off_safe
+          target_id: "relay_1_raw"
+
+  - platform: template
+    name: "Rasberries_02"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_2_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_2_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_2_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_2_raw"}
+
+  - platform: template
+    name: "Blueberries_03"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_3_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_3_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_3_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_3_raw"}
+
+  - platform: template
+    name: "Valve3_04"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_4_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_4_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_4_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_4_raw"}
+
+  - platform: template
+    name: "Valve4_05"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_5_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_5_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_5_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_5_raw"}
+
+  - platform: template
+    name: "Fert_Bypass_06"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_6_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_6_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_6_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_6_raw"}
+
+  - platform: template
+    name: "Fert1_07"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_7_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_7_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_7_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_7_raw"}
+
+  - platform: template
+    name: "Fert2_08"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_8_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_8_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_8_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_8_raw"}
+
+  - platform: template
+    name: "Fert3_09"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_9_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_9_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_9_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_9_raw"}
+
+  - platform: template
+    name: "24V_10"
+    icon: mdi:power
+    lambda: |-
+      return id(relay_10).state;
+    turn_on_action:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_10
+      - script.execute: v24_off_delay
+      # Optional timed off for 24V backbone itself (comment out if you want manual control)
+      # - delay: 120min
+      # - switch.turn_off: relay_10
+    turn_off_action:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_10
+      - script.execute: v24_off_delay
+
+  - platform: template
+    name: "Relay 11"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_11_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_11_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_11_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_11_raw"}
+
+  - platform: template
+    name: "Relay 12"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_12_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_12_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_12_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_12_raw"}
+
+  - platform: template
+    name: "Relay 13"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_13_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_13_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_13_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_13_raw"}
+
+  - platform: template
+    name: "Relay 14"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_14_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_14_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_14_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_14_raw"}
+
+  - platform: template
+    name: "Relay 15"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_15_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_15_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_15_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_15_raw"}
+
+  - platform: template
+    name: "Relay 16"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_16_raw).state;
+    turn_on_action:
+      - script.execute: {id: set_coil_on_safe, target_id: "relay_16_raw"}
+      - delay: 120min
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_16_raw"}
+    turn_off_action:
+      - script.execute: {id: set_coil_off_safe, target_id: "relay_16_raw"}
+# -------------------- Fertilizer Pump (MODBUS) --------------------
