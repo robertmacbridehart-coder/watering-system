@@ -1,0 +1,500 @@
+################################################################################
+# Notification System - Testing Automations
+# Purpose: Daily, monthly, and de-winterization testing with failure detection
+# Location: home-assistant/packages/notification_tests.yaml
+################################################################################
+
+automation:
+  ############################################################################
+  # DAILY EMAIL TEST
+  # Runs at 19:00 daily, sends self-test email, monitors for arrival
+  # Failure sets notification_system_error = ON (blocks watering in preflight)
+  ############################################################################
+
+  # Daily Email Test - Send
+  # Triggers: 19:00 daily
+  # Action: Send test email to self
+  - id: notification_daily_email_test_send
+    alias: "Notification Test - Daily Email Send"
+    description: "Send daily email test at 19:00"
+    mode: single
+    trigger:
+      - platform: time
+        at: "19:00:00"
+    condition:
+      # Skip if system winterized
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+    action:
+      # Update timestamp
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.last_email_test
+        data:
+          datetime: "{{ now().isoformat() }}"
+
+      # Send test email
+      - service: notify.gmail_smtp
+        data:
+          title: "Daily Notification Test"
+          message: |
+            This is an automated test sent at {{ now().strftime('%Y-%m-%d %H:%M:%S') }}.
+            If you receive this, email notifications are working correctly.
+
+            Next test: Tomorrow at 19:00
+
+            This message was sent by your Home Assistant watering system.
+
+  # Daily Email Test - Monitor
+  # Triggers: When daily test is sent
+  # Action: Wait 5 minutes for imap_content event, flag failure if timeout
+  - id: notification_daily_email_test_monitor
+    alias: "Notification Test - Daily Email Monitor"
+    description: "Flag failure if email not received within 5 minutes"
+    mode: restart
+    trigger:
+      - platform: state
+        entity_id: input_datetime.last_email_test
+    action:
+      # Wait 5 minutes for imap_content event with test email
+      - wait_for_trigger:
+          - platform: event
+            event_type: "imap_content"
+            event_data:
+              subject: "Daily Notification Test"
+        timeout:
+          minutes: 5
+        continue_on_timeout: true
+
+      # Check if timeout occurred (no event received)
+      - condition: template
+        value_template: "{{ wait.trigger is none }}"
+
+      # Check winterization (don't flag error if winterized)
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Email test failed - set error flag
+      - service: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.notification_system_error
+
+      # Log error details
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.notification_error_message
+        data:
+          value: "Daily email test failed - no email received within 5 minutes"
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.notification_error_channel
+        data:
+          value: "Email"
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.notification_error_time
+        data:
+          datetime: "{{ now().isoformat() }}"
+
+      # Send CRITICAL alert via WhatsApp
+      - service: script.send_critical_notification
+        data:
+          message: "Daily email test failed. Email notifications not working."
+
+  # Daily Email Test - Success Reset
+  # Triggers: imap_content event with test email detected
+  # Action: Clear error flag if it was set
+  - id: notification_daily_email_test_success
+    alias: "Notification Test - Daily Email Success"
+    description: "Clear error flag when test email arrives"
+    mode: single
+    trigger:
+      - platform: event
+        event_type: "imap_content"
+        event_data:
+          subject: "Daily Notification Test"
+    condition:
+      # Error flag is currently ON (only clear if there's an error to clear)
+      - condition: state
+        entity_id: input_boolean.notification_system_error
+        state: "on"
+    action:
+      # Clear error flag
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.notification_system_error
+
+      # Clear error message
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.notification_error_message
+        data:
+          value: ""
+
+  ############################################################################
+  # MONTHLY WHATSAPP TEST
+  # Runs on 1st at 19:00, requires user confirmation within 24h
+  # Failure sends CRITICAL email after 24h
+  ############################################################################
+
+  # Monthly WhatsApp Test - Send
+  # Triggers: 1st of month at 19:00
+  # Action: Send test WhatsApp, reset confirmation flag
+  - id: notification_monthly_whatsapp_test_send
+    alias: "Notification Test - Monthly WhatsApp Send"
+    description: "Send monthly WhatsApp test on 1st at 19:00"
+    mode: single
+    trigger:
+      - platform: time
+        at: "19:00:00"
+    condition:
+      # Only on 1st of month
+      - condition: template
+        value_template: "{{ now().day == 1 }}"
+
+      # Skip if winterized
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+    action:
+      # Reset confirmation flag
+      - service: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.monthly_test_whatsapp_confirmed
+
+      # Update timestamp
+      - service: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.last_monthly_test
+        data:
+          datetime: "{{ now().isoformat() }}"
+
+      # Send test message
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: |
+            📋 Monthly Notification Test
+            Sent: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+
+            Action Required:
+            Click confirmation button in Home Assistant dashboard within 24 hours.
+
+            Dashboard: Settings → Notifications → Monthly Test Confirmation
+
+  # Monthly WhatsApp Test - Reminder
+  # Triggers: 12 hours after test sent
+  # Action: Send reminder if not yet confirmed
+  - id: notification_monthly_whatsapp_test_reminder
+    alias: "Notification Test - Monthly WhatsApp Reminder"
+    description: "Remind user to confirm test (12h mark)"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_datetime.last_monthly_test
+        for:
+          hours: 12
+    condition:
+      # Test was sent (not winterized)
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # NOT yet confirmed
+      - condition: state
+        entity_id: input_boolean.monthly_test_whatsapp_confirmed
+        state: "off"
+    action:
+      # Send reminder via WhatsApp
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: |
+            ⏰ Reminder: Monthly WhatsApp Test
+
+            You have 12 hours remaining to confirm the test in Home Assistant.
+
+            If not confirmed, a CRITICAL alert will be sent via Email.
+
+  # Monthly WhatsApp Test - Failure Alert
+  # Triggers: 24 hours after test sent
+  # Action: Send CRITICAL email if still not confirmed
+  - id: notification_monthly_whatsapp_test_failure
+    alias: "Notification Test - Monthly WhatsApp Failure"
+    description: "Send CRITICAL email after 24h if unconfirmed"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_datetime.last_monthly_test
+        for:
+          hours: 24
+    condition:
+      # Test was sent (not winterized)
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Still NOT confirmed after 24h
+      - condition: state
+        entity_id: input_boolean.monthly_test_whatsapp_confirmed
+        state: "off"
+    action:
+      # Send CRITICAL via Email only (WhatsApp is the channel being tested)
+      - service: notify.gmail_smtp
+        data:
+          title: "🚨 CRITICAL: Monthly WhatsApp Test Failed"
+          message: |
+            Monthly WhatsApp test was not confirmed within 24 hours.
+
+            Test sent: {{ states('input_datetime.last_monthly_test') }}
+            Current time: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+
+            WhatsApp notifications may not be working.
+
+            Action Required:
+            1. Check WhatsApp on your phone
+            2. Verify you received the test message
+            3. If not received, check CallMeBot API status
+            4. Confirm test in Home Assistant to clear this alert
+
+  # Monthly WhatsApp Test - Success Reset
+  # Triggers: User clicks confirmation button
+  # Action: Log success, reset confirmation flag for next month
+  - id: notification_monthly_whatsapp_test_success
+    alias: "Notification Test - Monthly WhatsApp Success"
+    description: "Log success when user confirms test"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.monthly_test_whatsapp_confirmed
+        to: "on"
+    action:
+      # Log success (confirmation flag stays ON until next test)
+      - service: logbook.log
+        data:
+          name: "Monthly WhatsApp Test"
+          message: "Test confirmed successfully"
+          entity_id: input_boolean.monthly_test_whatsapp_confirmed
+
+  ############################################################################
+  # DE-WINTERIZATION TEST
+  # Triggers when system_winterized switches OFF
+  # Tests both WhatsApp AND Email, requires both confirmations within 24h
+  ############################################################################
+
+  # De-winterization Test - Trigger
+  # Triggers: system_winterized OFF
+  # Action: Send test via both channels, reset confirmation flags
+  - id: notification_dewinterization_test_trigger
+    alias: "Notification Test - De-winterization Trigger"
+    description: "Send de-winterization test when system powered back on"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.system_winterized
+        from: "on"
+        to: "off"
+    action:
+      # Reset both confirmation flags
+      - service: input_boolean.turn_off
+        target:
+          entity_id:
+            - input_boolean.dewinter_test_whatsapp_confirmed
+            - input_boolean.dewinter_test_email_confirmed
+
+      # Send WhatsApp test
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: |
+            🌱 System De-winterization Test - WhatsApp Channel
+            Sent: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+
+            Action Required:
+            Confirm receipt of this WhatsApp message in Home Assistant dashboard within 24 hours.
+
+            You must also confirm Email channel separately.
+
+            Automatic watering will remain disabled until both channels confirmed.
+
+      # Send Email test
+      - service: notify.gmail_smtp
+        data:
+          title: "🌱 De-winterization Test - Email Channel"
+          message: |
+            System De-winterization Test
+            Sent: {{ now().strftime('%Y-%m-%d %H:%M:%S') }}
+
+            Action Required:
+            Confirm receipt of this email in Home Assistant dashboard within 24 hours.
+
+            You must also confirm WhatsApp channel separately.
+
+            Automatic watering will remain disabled until both channels confirmed.
+
+  # De-winterization Test - Monitor & Failure Alert
+  # Triggers: 24 hours after de-winterization
+  # Action: Send CRITICAL if any channel unconfirmed
+  - id: notification_dewinterization_test_monitor
+    alias: "Notification Test - De-winterization Monitor"
+    description: "Check confirmations 24h after de-winterization"
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_boolean.system_winterized
+        from: "on"
+        to: "off"
+        for:
+          hours: 24
+    condition:
+      # At least one channel NOT confirmed
+      - condition: or
+        conditions:
+          - condition: state
+            entity_id: input_boolean.dewinter_test_whatsapp_confirmed
+            state: "off"
+          - condition: state
+            entity_id: input_boolean.dewinter_test_email_confirmed
+            state: "off"
+    action:
+      # Determine which channel(s) failed
+      - variables:
+          whatsapp_status: >
+            {% if is_state('input_boolean.dewinter_test_whatsapp_confirmed', 'on') %}
+              Confirmed ✓
+            {% else %}
+              UNCONFIRMED ✗
+            {% endif %}
+          email_status: >
+            {% if is_state('input_boolean.dewinter_test_email_confirmed', 'on') %}
+              Confirmed ✓
+            {% else %}
+              UNCONFIRMED ✗
+            {% endif %}
+
+      # Send CRITICAL via both channels
+      - service: script.send_critical_notification
+        data:
+          message: |
+            De-winterization test failed after 24 hours.
+
+            WhatsApp: {{ whatsapp_status }}
+            Email: {{ email_status }}
+
+            Automatic watering remains disabled until both channels confirmed.
+
+  # De-winterization Test - Success
+  # Triggers: Both confirmations complete
+  # Action: Log success, enable system
+  - id: notification_dewinterization_test_success
+    alias: "Notification Test - De-winterization Success"
+    description: "Mark system ready when both channels confirmed"
+    mode: single
+    trigger:
+      # Both flags turned ON
+      - platform: state
+        entity_id: input_boolean.dewinter_test_whatsapp_confirmed
+        to: "on"
+      - platform: state
+        entity_id: input_boolean.dewinter_test_email_confirmed
+        to: "on"
+    condition:
+      # BOTH confirmations are ON
+      - condition: state
+        entity_id: input_boolean.dewinter_test_whatsapp_confirmed
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.dewinter_test_email_confirmed
+        state: "on"
+    action:
+      # Log success
+      - service: logbook.log
+        data:
+          name: "De-winterization Test"
+          message: "Both channels confirmed. System ready for automatic operation."
+
+      # Send confirmation via standard notification
+      - service: script.send_standard_notification
+        data:
+          message: |
+            De-winterization test complete.
+            Both notification channels confirmed working.
+            System ready for automatic operation.
+
+  ############################################################################
+  # RECONNECT ALERT
+  # Triggers when user returns home while notification_system_error = ON
+  # Sends local HA mobile app notification (bypasses failed channels)
+  ############################################################################
+
+  - id: notification_system_error_reconnect_alert
+    alias: "Notification Alert - Error on Reconnect"
+    description: "Alert user of notification error when reconnecting to local network"
+    mode: single
+    trigger:
+      # User arrives home (or phone connects to local network)
+      - platform: state
+        entity_id: person.robert_hart
+        to: "home"
+    condition:
+      # Notification system error flag is ON
+      - condition: state
+        entity_id: input_boolean.notification_system_error
+        state: "on"
+    action:
+      # Send local mobile app notification
+      # This bypasses WhatsApp/Email and uses HA Companion app
+      - service: notify.mobile_app_rdad_s_phone
+        data:
+          title: "⚠️ Notification System Error"
+          message: |
+            Channel failure detected while you were away.
+
+            Last error: {{ states('input_text.notification_error_message') }}
+            Error time: {{ states('input_datetime.notification_error_time') }}
+            Failed channel: {{ states('input_text.notification_error_channel') }}
+
+            Action: Check notification settings and test channels.
+          data:
+            priority: high
+            ttl: 0
+            channel: Alert
+
+################################################################################
+# Dashboard Confirmation Buttons (Example Configuration)
+################################################################################
+
+# Add these to your Lovelace dashboard for test confirmations:
+
+# Monthly WhatsApp Test Confirmation:
+# type: button
+# name: Confirm Monthly WhatsApp Test
+# entity: input_boolean.monthly_test_whatsapp_confirmed
+# tap_action:
+#   action: toggle
+# icon: mdi:check-circle
+
+# De-winterization WhatsApp Confirmation:
+# type: button
+# name: Confirm WhatsApp Working
+# entity: input_boolean.dewinter_test_whatsapp_confirmed
+# tap_action:
+#   action: toggle
+# icon: mdi:check-circle
+
+# De-winterization Email Confirmation:
+# type: button
+# name: Confirm Email Working
+# entity: input_boolean.dewinter_test_email_confirmed
+# tap_action:
+#   action: toggle
+# icon: mdi:check-circle
+# icon: mdi:check-circle
+# tap_action:
+#   action: toggle
+# icon: mdi:check-circle

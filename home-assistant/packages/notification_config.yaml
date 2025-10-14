@@ -1,0 +1,95 @@
+################################################################################
+# Notification System - Service Configuration
+# Purpose: REST commands, SMTP, and IMAP integrations
+# Location: home-assistant/packages/notification_config.yaml
+################################################################################
+
+################################################################################
+# REST Command - WhatsApp via CallMeBot API
+################################################################################
+
+rest_command:
+  # Send WhatsApp Message via CallMeBot
+  # API Endpoint: https://api.callmebot.com/whatsapp.php
+  # Method: GET with query parameters
+  # Rate Limit: No official limit, but avoid spam
+  send_whatsapp_notification:
+    url: >
+      https://api.callmebot.com/whatsapp.php?source=HA&phone={{ phone | urlencode }}&apikey={{ apikey }}&text={{ text | urlencode }}
+    method: GET
+    timeout: 10
+    verify_ssl: true
+    # Response codes:
+    # 200: Success
+    # 400: Bad request (invalid phone/apikey)
+    # 500: Server error
+
+################################################################################
+# Email Notification - Gmail SMTP
+################################################################################
+
+notify:
+  # Gmail SMTP Platform
+  # Server: smtp.gmail.com:587 (TLS)
+  # Requires app password (not regular Gmail password)
+  # Auto-forwards to primary email via Gmail settings
+  - name: gmail_smtp
+    platform: smtp
+    server: smtp.gmail.com
+    port: 587
+    timeout: 15
+    encryption: starttls
+    sender: !secret gmail_username
+    sender_name: "Watering System Notifications"
+    username: !secret gmail_username
+    password: !secret gmail_app_password
+    recipient:
+      - !secret gmail_username  # Send to self, auto-forwards
+
+################################################################################
+# Email Integration - Gmail IMAP (Inbox Monitoring)
+# Purpose: Detect incoming emails for daily test verification
+################################################################################
+
+# IMAP integration is configured via UI (Settings → Devices & Services → IMAP)
+# This cannot be configured in YAML as of Home Assistant 2023.4+
+#
+# Manual Setup Completed:
+# Device Name: Gmail Notification Monitor
+# Server: imap.gmail.com:993
+# Search: SUBJECT "Daily Notification Test"
+#
+# This creates:
+# - Sensor: sensor.gmail_notification_monitor (unread email count)
+# - Event: imap_content (fired when matching email arrives)
+#
+# The notification_tests.yaml automations listen for imap_content events
+# triggered when emails with subject "Daily Notification Test" arrive
+
+################################################################################
+# Secrets Required (add to secrets.yaml)
+################################################################################
+
+# whatsapp_phone: "+49XXXXXXXXX"  # Your German mobile number (recipient)
+# whatsapp_api_key: "XXXXXXXXX"    # CallMeBot API key from registration
+# gmail_username: "your-email@gmail.com"
+# gmail_app_password: "xxxxxxxxxxxx"  # Gmail app password (not regular password)
+
+################################################################################
+# Notes
+################################################################################
+
+# CallMeBot Registration:
+# - Send WhatsApp message "I allow callmebot to send me messages" to +34 694 242 562
+# - Receive API key in response
+# - Registration number (+34 694 242 562) is NOT used in API calls
+
+# Gmail App Password:
+# - Enable 2FA on Gmail account
+# - Generate app password: Google Account → Security → 2-Step Verification → App passwords
+# - Use app password in secrets.yaml (not your regular Gmail password)
+
+# Gmail Auto-Forward:
+# - Configure in Gmail web interface: Settings → Forwarding and POP/IMAP
+# - Add forwarding address → Verify via email
+# - Choose "Forward a copy of incoming mail" → Save

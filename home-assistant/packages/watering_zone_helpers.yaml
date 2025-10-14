@@ -1,0 +1,1029 @@
+###############################################################################
+# Watering System - Per-Zone Configuration Helpers
+#
+# File: home-assistant/packages/watering_zone_helpers.yaml
+# Purpose: Per-zone settings for weather-based watering program selection
+#          and runtime calculations
+#
+# Entity Count: 96 helpers (24 per zone × 4 zones)
+#   - 4 input_text (friendly names for dynamic naming)
+#   - 8 input_select (4 season + 4 program)
+#   - 84 input_number (4 base runtime + 80 seasonal thresholds)
+#
+# Zone Assignments:
+#   - Zone 1: Raspberries (berry canes, moderate water needs)
+#   - Zone 2: Blueberries (shallow roots, higher water needs)
+#   - Zone 3: TBD (placeholder for future crop)
+#   - Zone 4: TBD (placeholder for future crop)
+#
+# Friendly Naming Strategy:
+#   - Base name stored in input_text.zone_{id}_friendly_name
+#   - All other helpers use Jinja templates to reference base name
+#   - Allows changing zone assignment without editing 70+ friendly names
+#
+# Weather Evaluation Logic (window_check state):
+#   if rain_72h > rain_off_mm: program = off
+#   elif rain_24h > rain_light_mm: program = light
+#   elif temp_avg_3day > temp_heavy_c AND rain_72h < rain_min_mm: program = heavy
+#   elif temp_avg_3day > temp_normal_c: program = normal
+#   else: program = light
+#
+# Last Updated: 2025-10-14
+###############################################################################
+
+# ============================================================================
+# Friendly Name Helpers
+# ============================================================================
+input_text:
+  zone_1_friendly_name:
+    name: "Zone 1 Friendly Name"
+    initial: "Raspberries"
+    icon: mdi:fruit-cherries
+    max: 30
+
+  zone_2_friendly_name:
+    name: "Zone 2 Friendly Name"
+    initial: "Blueberries"
+    icon: mdi:fruit-cherries
+    max: 30
+
+  zone_3_friendly_name:
+    name: "Zone 3 Friendly Name"
+    initial: "Zone 3"
+    icon: mdi:sprout
+    max: 30
+
+  zone_4_friendly_name:
+    name: "Zone 4 Friendly Name"
+    initial: "Zone 4"
+    icon: mdi:sprout
+    max: 30
+
+
+# ============================================================================
+# Zone Season and Program Selection
+# ============================================================================
+input_select:
+  # --- Season Selectors ---
+  zone_1_season:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    initial: spring
+
+  zone_2_season:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    initial: spring
+
+  zone_3_season:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    initial: spring
+
+  zone_4_season:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    initial: spring
+
+  # --- Program Overrides ---
+  zone_1_program:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Watering Program"
+    icon: mdi:water
+    options:
+      - off
+      - light
+      - normal
+      - heavy
+    initial: normal
+
+  zone_2_program:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Watering Program"
+    icon: mdi:water
+    options:
+      - off
+      - light
+      - normal
+      - heavy
+    initial: normal
+
+  zone_3_program:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Watering Program"
+    icon: mdi:water
+    options:
+      - off
+      - light
+      - normal
+      - heavy
+    initial: normal
+
+  zone_4_program:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Watering Program"
+    icon: mdi:water
+    options:
+      - off
+      - light
+      - normal
+      - heavy
+    initial: normal
+
+
+# ============================================================================
+# Zone Runtime Configuration
+# ============================================================================
+input_number:
+  # --- Base Runtimes ---
+  zone_1_base_runtime_min:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_2_base_runtime_min:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_3_base_runtime_min:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_4_base_runtime_min:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+
+  # ==========================================================================
+  # Zone 1 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_1_spring_rain_off_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_rain_light_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_rain_min_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_temp_heavy_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_spring_temp_normal_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_1_summer_rain_off_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_rain_light_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_rain_min_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_temp_heavy_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_summer_temp_normal_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_1_fall_rain_off_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_rain_light_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_rain_min_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_temp_heavy_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_fall_temp_normal_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_1_winter_rain_off_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_rain_light_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_rain_min_mm:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_temp_heavy_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_winter_temp_normal_c:
+    name: "{{ states('input_text.zone_1_friendly_name') }} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+
+  # ==========================================================================
+  # Zone 2 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_2_spring_rain_off_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_rain_light_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_rain_min_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_temp_heavy_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_spring_temp_normal_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_2_summer_rain_off_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_rain_light_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_rain_min_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_temp_heavy_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_summer_temp_normal_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_2_fall_rain_off_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_rain_light_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_rain_min_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_temp_heavy_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_fall_temp_normal_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_2_winter_rain_off_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_rain_light_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_rain_min_mm:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_temp_heavy_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_winter_temp_normal_c:
+    name: "{{ states('input_text.zone_2_friendly_name') }} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+
+  # ==========================================================================
+  # Zone 3 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_3_spring_rain_off_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_rain_light_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_rain_min_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_temp_heavy_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_spring_temp_normal_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_3_summer_rain_off_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_rain_light_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_rain_min_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_temp_heavy_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_summer_temp_normal_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_3_fall_rain_off_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_rain_light_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_rain_min_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_temp_heavy_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_fall_temp_normal_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_3_winter_rain_off_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_rain_light_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_rain_min_mm:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_temp_heavy_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_winter_temp_normal_c:
+    name: "{{ states('input_text.zone_3_friendly_name') }} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+
+  # ==========================================================================
+  # Zone 4 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_4_spring_rain_off_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_rain_light_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_rain_min_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_temp_heavy_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_spring_temp_normal_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_4_summer_rain_off_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_rain_light_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_rain_min_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_temp_heavy_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_summer_temp_normal_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_4_fall_rain_off_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_rain_light_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_rain_min_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_temp_heavy_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_fall_temp_normal_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_4_winter_rain_off_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_rain_light_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_rain_min_mm:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_temp_heavy_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_winter_temp_normal_c:
+    name: "{{ states('input_text.zone_4_friendly_name') }} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box

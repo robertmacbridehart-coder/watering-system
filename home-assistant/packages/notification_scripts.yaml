@@ -1,0 +1,160 @@
+################################################################################
+# Notification System - Tiered Notification Scripts
+# Purpose: Central communication scripts for all system notifications
+# Location: home-assistant/packages/notification_scripts.yaml
+################################################################################
+
+script:
+  ############################################################################
+  # CRITICAL Tier - WhatsApp + Email (Simultaneous)
+  # Use for: Emergency stops, tank failures, system errors, test failures
+  ############################################################################
+
+  send_critical_notification:
+    alias: "Send CRITICAL Notification"
+    description: "Send critical alert via WhatsApp and Email"
+    icon: mdi:alert-octagon
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Critical event message"
+        example: "Tank Low-Low emergency stop"
+        required: true
+    sequence:
+      # Check winterization status
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Format message with timestamp and emoji
+      - variables:
+          timestamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          formatted_message: >
+            🚨 CRITICAL: {{ message }}
+            Time: {{ timestamp }}
+            Action Required: Check system immediately
+      # Send via WhatsApp
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{ formatted_message }}"
+        continue_on_error: true
+
+      # Send via Email
+      - service: notify.gmail_smtp
+        data:
+          title: "🚨 CRITICAL: Watering System Alert"
+          message: "{{ formatted_message }}"
+        continue_on_error: true
+
+  ############################################################################
+  # HIGH Tier - WhatsApp + Email (Simultaneous)
+  # Use for: Warnings, degraded states, runtime limits, preflight failures
+  ############################################################################
+
+  send_high_notification:
+    alias: "Send HIGH Notification"
+    description: "Send high-priority warning via WhatsApp and Email"
+    icon: mdi:alert
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Warning message"
+        example: "Zone runtime exceeded safety limit"
+        required: true
+    sequence:
+      # Check winterization status
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Format message with timestamp and emoji
+      - variables:
+          timestamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          formatted_message: >
+            ⚠️ WARNING: {{ message }}
+            Time: {{ timestamp }}
+            System Status: Check dashboard for details
+
+      # Send via WhatsApp
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{ formatted_message }}"
+        continue_on_error: true
+
+      # Send via Email
+      - service: notify.gmail_smtp
+        data:
+          title: "⚠️ WARNING: Watering System"
+          message: "{{ formatted_message }}"
+        continue_on_error: true
+
+  ############################################################################
+  # STANDARD Tier - WhatsApp Only
+  # Use for: Watering summaries, informational updates, routine notifications
+  ############################################################################
+
+  send_standard_notification:
+    alias: "Send STANDARD Notification"
+    description: "Send standard informational message via WhatsApp only"
+    icon: mdi:message-text
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Informational message"
+        example: "Watering cycle complete - 3 zones watered"
+        required: true
+    sequence:
+      # Check winterization status
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Format message with timestamp and emoji
+      - variables:
+          timestamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          formatted_message: >
+            ✅ {{ message }}
+            Time: {{ timestamp }}
+
+      # Send via WhatsApp only (standard tier)
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{ formatted_message }}"
+        continue_on_error: true
+
+################################################################################
+# Usage Examples (for future integration)
+################################################################################
+
+# Example 1: Safety automation calls critical notification
+# - service: script.send_critical_notification
+#   data:
+#     message: "Tank Low-Low level reached. System stopped."
+
+# Example 2: Zone runtime safety calls high notification
+# - service: script.send_high_notification
+#   data:
+#     message: "Zone 1 exceeded max runtime and was stopped."
+
+# Example 3: State machine calls standard notification
+# - service: script.send_standard_notification
+#   data:
+#     message: |
+#       Watering Summary - Morning Window
+#       Zones: 1 (normal), 2 (light), 4 (heavy)
+#       Fertilizer: Zone 3 - Pump 1: 60ml
+#       Errors: None
+#       Runtime: 45min
+#       Zones: 1 (normal), 2 (light), 4 (heavy)
+#       Fertilizer: Zone 3 - Pump 1: 60ml
+#       Errors: None
+#       Runtime: 45min

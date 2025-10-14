@@ -1,0 +1,139 @@
+################################################################################
+# Notification System - Configuration Helpers
+# Purpose: Input helpers and template sensors for notification system
+# Location: home-assistant/packages/notification_helpers.yaml
+################################################################################
+
+# Input Booleans - User Controls and System State
+input_boolean:
+  # Winterization Control
+  # When ON: All notifications and tests disabled
+  # When OFF: Triggers de-winterization test
+  system_winterized:
+    name: "System Winterized"
+    icon: mdi:snowflake
+    initial: off
+
+  # Notification System Health
+  # Set to ON when daily email test fails
+  # Checked in preflight_check to block watering
+  notification_system_error:
+    name: "Notification System Error"
+    icon: mdi:alert-circle
+    initial: off
+
+  # Monthly WhatsApp Test Confirmation
+  # User clicks confirmation button within 24h of test
+  # Resets to OFF after successful test logged
+  monthly_test_whatsapp_confirmed:
+    name: "Monthly WhatsApp Test Confirmed"
+    icon: mdi:check-circle
+    initial: off
+
+  # De-winterization Test Confirmations
+  # Both must be confirmed within 24h to enable system
+  dewinter_test_whatsapp_confirmed:
+    name: "De-winterization WhatsApp Test Confirmed"
+    icon: mdi:check-circle
+    initial: off
+
+  dewinter_test_email_confirmed:
+    name: "De-winterization Email Test Confirmed"
+    icon: mdi:check-circle
+    initial: off
+
+################################################################################
+# Template Sensors - Derived State and Tracking
+################################################################################
+
+template:
+  - sensor:
+      # Last Email Test Time
+      # Tracks timestamp of most recent daily email test attempt
+      - name: "Last Email Test Time"
+        unique_id: last_email_test_time
+        icon: mdi:email-check
+        state: >
+          {% set test = states('input_datetime.last_email_test') %}
+          {% if test not in ['unknown', 'unavailable', 'none'] %}
+            {{ test }}
+          {% else %}
+            Never
+          {% endif %}
+        attributes:
+          friendly_name: "Last Email Test"
+          last_updated: "{{ now().isoformat() }}"
+
+      # Last Monthly Test Time
+      # Tracks timestamp of most recent monthly WhatsApp test
+      - name: "Last Monthly Test Time"
+        unique_id: last_monthly_test_time
+        icon: mdi:calendar-check
+        state: >
+          {% set test = states('input_datetime.last_monthly_test') %}
+          {% if test not in ['unknown', 'unavailable', 'none'] %}
+            {{ test }}
+          {% else %}
+            Never
+          {% endif %}
+        attributes:
+          friendly_name: "Last Monthly Test"
+          last_updated: "{{ now().isoformat() }}"
+
+      # Last Notification Error
+      # Stores most recent notification failure details
+      # Updated by scripts when REST API calls fail
+      - name: "Last Notification Error"
+        unique_id: last_notification_error
+        icon: mdi:alert-circle-outline
+        state: >
+          {% set error = states('input_text.notification_error_message') %}
+          {% if error not in ['unknown', 'unavailable', 'none', ''] %}
+            Error
+          {% else %}
+            OK
+          {% endif %}
+        attributes:
+          message: "{{ states('input_text.notification_error_message') }}"
+          timestamp: "{{ states('input_datetime.notification_error_time') }}"
+          channel: "{{ states('input_text.notification_error_channel') }}"
+
+################################################################################
+# Input DateTime - Timestamp Storage
+# Used by template sensors to track test execution times
+################################################################################
+
+input_datetime:
+  last_email_test:
+    name: "Last Email Test"
+    has_date: true
+    has_time: true
+    icon: mdi:email-check
+
+  last_monthly_test:
+    name: "Last Monthly Test"
+    has_date: true
+    has_time: true
+    icon: mdi:calendar-check
+
+  notification_error_time:
+    name: "Notification Error Time"
+    has_date: true
+    has_time: true
+    icon: mdi:clock-alert
+
+################################################################################
+# Input Text - Error Message Storage
+# Stores details of notification failures
+################################################################################
+
+input_text:
+  notification_error_message:
+    name: "Notification Error Message"
+    max: 255
+    icon: mdi:message-alert
+
+  notification_error_channel:
+    name: "Notification Error Channel"
+    max: 50
+    icon: mdi:pipe
