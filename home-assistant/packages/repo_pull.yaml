@@ -1,0 +1,43 @@
+# Repo Pull Package
+# Syncs public GitHub repo to Home Assistant configuration
+# Note: Automated pulls via shell_command are non-functional on HAOS
+# Use manual execution: /bin/sh /config/scripts/pull_public_repo.sh
+
+command_line:
+  - sensor:
+      name: "Repo Pull"
+      command: "cat /config/version.json 2>/dev/null || echo {}"
+      command_timeout: 30
+      scan_interval: 300
+      value_template: "{{(value_json.tag | default('unknown'))}}"
+      json_attributes:
+        - repo
+        - branch
+        - tag
+        - sha
+        - pulled_at
+      unique_id: repo_pull_sha
+
+template:
+  - trigger:
+      - platform: state
+        entity_id: sensor.repo_pull
+        attribute: pulled_at
+    sensor:
+      - name: "Repo Pull Time"
+        unique_id: repo_pull_time
+        device_class: timestamp
+        icon: mdi:clock-check
+        state: "{{state_attr('sensor.repo_pull', 'pulled_at')}}"
+
+  - sensor:
+      - name: "Repo Pull Short SHA"
+        unique_id: repo_pull_short_sha
+        icon: mdi:source-commit
+        state: >
+          {% set sha = state_attr('sensor.repo_pull', 'sha') %}
+          {% if sha and sha not in ['unknown', 'unavailable', none] and sha | length >= 7 %}
+            {{sha[:7]}}
+          {% else %}
+            unknown
+          {% endif %}
