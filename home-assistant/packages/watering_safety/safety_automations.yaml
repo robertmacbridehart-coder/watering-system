@@ -1,0 +1,386 @@
+---
+# ============================================================================
+# Watering Safety Automations - Phase 3.4 + Phase 5
+# ============================================================================
+# Location: home-assistant/packages/watering_safety/safety_automations.yaml
+#
+# Home for watering safety-layer automations. See docs/impl_roadmap.md Section
+# 3.4 for the design.
+#
+# File naming: deliberately NOT `automations.yaml`. `!include_dir_named` keys
+# packages by file BASENAME, which must be globally unique across the whole
+# packages/ tree (START_HERE.md Top Gotchas). `safety_automations.yaml` mirrors
+# the proven `watering_db/db_automations.yaml` convention and is collision-safe.
+#
+# Contents:
+#   1. watering_safety_r1_comms_recovery  - reactive recovery for main-pump (R1)
+#      communication loss (Phase 3.4 Part B).
+#   2. watering_safety_tank_low_low       - mid-cycle Low-Low -> error_tank_low (5.1)
+#   3. watering_safety_comms_watchdog     - mid-cycle ESP32 dropout ->
+#      error_comms_lost via the R1-R7 availability proxy (5.1)
+#   4. watering_safety_zone_runtime_limit - zone valve on > max runtime ->
+#      close that zone + HIGH notify (5.1)
+#
+# The Phase 5 monitors (2-4) only LATCH a state; the Phase 4
+# watering_state_on_error table (watering_state/state_machine.yaml) does the
+# abort -> safe_shutdown -> finalize -> tiered-notify teardown on entry to each
+# error_* state. So a monitor's whole job is the single input_select.select_option.
+# ============================================================================
+
+automation:
+  # ==========================================================================
+  # R1 Comms-Lost Recovery (Phase 3.4 Part B)
+  # ==========================================================================
+  # When the ESP32 regains communication while the system is parked in
+  # error_comms_lost (set by the Phase 3.4 Part A fail-fast in stop_main_pump,
+  # pump_scripts.yaml), decide recovery from what the MAIN PUMP relay (R1)
+  # reports once it is readable again:
+  #
+  #   - R1 back ON  -> the pump ran uncontrolled while HA was blind, and the
+  #     rest of the relay set (zones/valves) is of unknown position. Escalate to
+  #     script.emergency_stop: all relays off, critical notification, latched
+  #     error_e_stop for human review. (Chosen over an R1-only stop_main_pump
+  #     re-run because the whole system state is suspect after a blind period.)
+  #   - R1 back OFF -> pump is confirmed off; nothing dangerous happened. Close
+  #     any zones left open during the outage and clear error_comms_lost to idle.
+  #
+  # Trigger breadth (Phase 3.4 "generalize" hardening, 2026-08-05): R1-R7 all
+  # share one ESP32 over one WiFi link, so a comms loss takes the whole device
+  # offline and a reconnect restores every relay together. Rather than depend on
+  # R1's own state-change event landing, we arm on ANY of the seven wet-path
+  # relays (R1-R7) returning from unavailable/unknown - whichever HA reports
+  # first - then read R1's LIVE state to decide. This makes recovery robust to
+  # relay event ordering; the decision itself stays purely R1-based.
+  #
+  # mode: single (not restart): the reconnect fires up to seven near-simultaneous
+  # triggers. single lets the first run finish and drops the rest, so a trigger
+  # storm can never cancel an in-flight emergency_stop. The "wait for R1"
+  # no-default branch completes instantly, so R1's own trigger is not lost to the
+  # single-mode window if a non-R1 relay happens to fire first.
+  #
+  # Implemented as an automation (not a waiting script) so it re-arms across HA
+  # restarts (input_select state is restored, so error_comms_lost survives a
+  # restart) and never blocks synchronous callers (safe_shutdown,
+  # open_pressure_relief, the future state machine).
+  # ==========================================================================
+  - id: watering_safety_r1_comms_recovery
+    alias: "Watering Safety - R1 Comms-Lost Recovery"
+    description: >-
+      Reactive recovery when the ESP32 regains communication while the system is
+      in error_comms_lost. Any watched entity coming back from unavailable/unknown
+      re-triggers; the action then decides on R1's LIVE state: R1 back ON ->
+      emergency_stop; R1 back OFF -> clear to idle. See impl_roadmap.md
+      Section 3.4 (Part B).
+    mode: single
+    trigger:
+      # Every entity whose unavailability can latch error_comms_lost is watched
+      # here, so whichever one recovers first re-arms the machine. R1-R7 cover the
+      # relay-availability proxies (preflight Check 2, start_main_pump interlock,
+      # stop_main_pump fail-fast); the Low-Low tank sensor covers preflight
+      # Check 1 (D-G maps its unavailability to error_comms_lost). Omitting the
+      # tank sensor here would leave a tank-sensor-only outage latched with no
+      # auto-recovery path, contradicting the "recovery is armed" operator alert.
+      - platform: state
+        entity_id:
+          - switch.watering_system_relay_1_main_pump
+          - switch.watering_system_relay_2_zone_1
+          - switch.watering_system_relay_3_zone_2
+          - switch.watering_system_relay_4_zone_3
+          - switch.watering_system_relay_5_zone_4
+          - switch.watering_system_relay_6_fert_bypass
+          - switch.watering_system_relay_7_fert_line
+          - binary_sensor.watering_system_low_low_water_level
+        from:
+          - "unavailable"
+          - "unknown"
+        to:
+          - "on"
+          - "off"
+    condition:
+      - condition: state
+        entity_id: input_select.watering_system_state
+        state: error_comms_lost
+    # §1.12 (cross-file ordering): neither branch below calls
+    # finalize_cycle_record. That is deliberate and relies on the Phase 4
+    # table-driven per-error automation (watering_state/state_machine.yaml,
+    # id: watering_state_on_error) having ALREADY closed the cycle row and
+    # cleared input_text.cycle_uuid at the moment error_comms_lost was
+    # entered. So by the time this recovery runs, there is no open row to close:
+    # the R1-back-OFF branch just returns to idle, and the R1-back-ON branch's
+    # emergency_stop -> error_e_stop leaves the already-closed row as-is
+    # (finalize_cycle_record would no-op on the empty cycle_uuid anyway). NOTE:
+    # this means a cycle that escalated comms-lost -> e_stop keeps its original
+    # notes: "error_comms_lost" and does not record the later e-stop disposition.
+    # If either file's error/finalize ordering changes, re-check this assumption.
+    action:
+      - choose:
+          # ----- R1 reads ON now: pump ran uncontrolled during the outage -----
+          # Decide on R1's LIVE state (any of R1-R7 may have fired the trigger).
+          - conditions:
+              - condition: state
+                entity_id: switch.watering_system_relay_1_main_pump
+                state: "on"
+            sequence:
+              - service: script.log_system_event
+                data:
+                  severity: warning
+                  event_type: pump_comms_restored
+                  message: >-
+                    Comms restored ({{ trigger.to_state.name }} came back); R1
+                    reads ON. Main pump ran uncontrolled during the outage;
+                    escalating to emergency_stop.
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  value_before: "unavailable"
+                  value_after: "on"
+                  logger: watering_system.safety_recovery
+
+              # Whole-system uncertainty after a blind period + an uncontrolled
+              # pump warrants a full estop (all relays off, critical
+              # notification, latched error_e_stop) rather than an R1-only stop.
+              - service: script.emergency_stop
+                data:
+                  reason: >-
+                    R1 comms restored reading ON - main pump ran uncontrolled
+                    during comms loss
+
+          # ----- R1 reads OFF now (verified live, not just at trigger time) ----
+          - conditions:
+              - condition: state
+                entity_id: switch.watering_system_relay_1_main_pump
+                state: "off"
+            sequence:
+              - service: script.log_system_event
+                data:
+                  severity: info
+                  event_type: pump_comms_restored
+                  message: >-
+                    Comms restored ({{ trigger.to_state.name }} came back); R1
+                    reads OFF. Main pump is off; closing any open zones and
+                    clearing error_comms_lost to idle.
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  value_before: "unavailable"
+                  value_after: "off"
+                  logger: watering_system.safety_recovery
+
+              # Zone valves may have been left open when comms dropped. With the
+              # pump confirmed off this is harmless (no flow), but close them so
+              # we return to a genuinely clean idle rather than idle-with-valves.
+              - service: script.close_all_zones
+
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: idle
+        # No default: if R1 is still unavailable/unknown when the action runs
+        # (a non-R1 relay fired first, or R1 flapped back), do nothing and stay
+        # in error_comms_lost. R1's own reconnect re-triggers; a stale/flappy
+        # read can never clear to idle or misfire an estop.
+
+  # ==========================================================================
+  # Tank Low-Low Mid-Cycle Monitor (Phase 5.1)
+  # ==========================================================================
+  # state_preflight_check samples Low-Low only at cycle START. If the tank
+  # crosses Low-Low WHILE a cycle is running, this independent monitor latches
+  # error_tank_low. It does nothing else: entry to error_tank_low fires the
+  # Phase 4 watering_state_on_error table (state_machine.yaml), which runs
+  # abort_cycle_scripts -> safe_shutdown (closes R1 + pressure relief) ->
+  # finalize_cycle_record(error) -> CRITICAL notify. Separation of concerns:
+  # this automation OWNS the mid-cycle detection; the table OWNS the response.
+  #
+  # No extra debounce here - the Low-Low binary_sensor already uses ESPHome
+  # delayed_on_off (Top Gotchas), so brief float chatter never reaches HA.
+  # ==========================================================================
+  - id: watering_safety_tank_low_low
+    alias: "Watering Safety - Tank Low-Low (mid-cycle)"
+    description: >-
+      Independent monitor: tank crosses Low-Low while a cycle is running ->
+      latch error_tank_low (the Phase 4 on_error table safes + notifies).
+      Covers the mid-cycle case preflight cannot. See impl_roadmap.md 5.1.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.watering_system_low_low_water_level
+        to: "on"
+    condition:
+      # Operational states only (binary_sensor.watering_operational is the single
+      # source of truth for that "not idle, not a control state, not already
+      # error_*" complement - defined in watering_helpers/config_helpers.yaml). A
+      # Low-Low reading while idle/parked/errored must not thrash the machine, and
+      # once we are in error_tank_low this guard (state != operational) prevents a
+      # re-fire.
+      - condition: state
+        entity_id: binary_sensor.watering_operational
+        state: "on"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.watering_system_state
+        data:
+          option: error_tank_low
+
+  # ==========================================================================
+  # Comms Watchdog - Mid-Cycle ESP32 Dropout (Phase 5.1)
+  # ==========================================================================
+  # Phase 3.4 Part A (stop_main_pump fail-fast) only fires when stop_main_pump
+  # is CALLED; Part B (watering_safety_r1_comms_recovery, above) only handles
+  # RECOVERY once already in error_comms_lost. Neither PROACTIVELY latches the
+  # error when the ESP32 drops mid-cycle. This watchdog fills that gap.
+  #
+  # Signal: the R1-R7 relay-availability proxy - the same set Part B keys off.
+  # All seven relays share one ESP32 over one WiFi link, so a device-level comms
+  # loss takes them unavailable together; whichever HA marks unavailable/unknown
+  # first (and it STAYS so for 10 s) fires. The 10 s `for:` rides out momentary
+  # WiFi blips so a single dropped keep-alive does not halt a healthy cycle.
+  #
+  # `from: [on, off]` (a genuine DROPOUT, not a cold start): on an HA restart the
+  # relays come up AT `unavailable` (there is no on/off -> unavailable transition),
+  # so this trigger does not fire during boot. Without the `from:` guard, a restart
+  # that restored an operational state - with the ESP32 taking >10 s to reconnect -
+  # could false-latch error_comms_lost before watering_state_restart_recovery
+  # demotes the state to idle. This loses no real coverage: preflight Check 2
+  # verifies relay availability at cycle start, so a mid-cycle loss is always an
+  # on/off -> unavailable edge. It is the symmetric inverse of Part B's recovery
+  # trigger (from: [unavailable, unknown] -> to: [on, off]).
+  #
+  # Action is only the state latch: entry to error_comms_lost fires the on_error
+  # table (HIGH notify), and Part B then owns recovery on reconnect. mode: single
+  # so the up-to-seven near-simultaneous unavailability triggers collapse to one.
+  # ==========================================================================
+  - id: watering_safety_comms_watchdog
+    alias: "Watering Safety - Comms Watchdog (mid-cycle ESP32 dropout)"
+    description: >-
+      Independent watchdog: any wet-path relay (R1-R7) unreachable for >10 s
+      while a cycle is running -> latch error_comms_lost (on_error sends HIGH
+      notify; Part B recovers on reconnect). See impl_roadmap.md 5.1.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - switch.watering_system_relay_1_main_pump
+          - switch.watering_system_relay_2_zone_1
+          - switch.watering_system_relay_3_zone_2
+          - switch.watering_system_relay_4_zone_3
+          - switch.watering_system_relay_5_zone_4
+          - switch.watering_system_relay_6_fert_bypass
+          - switch.watering_system_relay_7_fert_line
+        from:
+          - "on"
+          - "off"
+        to:
+          - "unavailable"
+          - "unknown"
+        for:
+          seconds: 10
+    condition:
+      # Operational states only (binary_sensor.watering_operational, same source
+      # of truth as the tank monitor). During idle the system is doing nothing, so
+      # a comms loss is caught by preflight at the next cycle start - latching here
+      # would be noise. watering_operational is also off in error_comms_lost, so a
+      # second relay dropping after the first already latched does not re-fire.
+      - condition: state
+        entity_id: binary_sensor.watering_operational
+        state: "on"
+    action:
+      - service: input_select.select_option
+        target:
+          entity_id: input_select.watering_system_state
+        data:
+          option: error_comms_lost
+
+  # ==========================================================================
+  # Zone Runtime Limit - Stuck-Valve Backstop (Phase 5.1)
+  # ==========================================================================
+  # If a zone valve (R2-R5) stays ON longer than
+  # input_number.max_single_zone_runtime_min, close THAT zone and send a HIGH
+  # notification. This is distinct from the planned-runtime CAP inside
+  # calculate_zone_runtime (zone_scripts.yaml), which bounds the INTENDED
+  # runtime; this watches ACTUAL valve-on duration against a stuck valve or a
+  # runaway sequence. It closes only the offending zone - the cycle is not
+  # aborted (a single overrun is a local fault, not a whole-cycle failure).
+  #
+  # The `for:` duration is templated from the live helper (architecture.md §7
+  # pattern), so changing the limit needs no automation edit. Each zone relay is
+  # watched independently; mode: parallel (max 4) lets two overruns be handled
+  # at once. Guard: fire in EVERY state except manual_override - a stuck valve is
+  # worth closing while idle or winterized too, but during hands-on override the
+  # operator may deliberately hold a valve open, so we stand down there.
+  # ==========================================================================
+  - id: watering_safety_zone_runtime_limit
+    alias: "Watering Safety - Zone Runtime Limit (stuck-valve backstop)"
+    description: >-
+      Independent backstop: a zone valve on longer than
+      max_single_zone_runtime_min -> close that zone + HIGH notify. Watches
+      ACTUAL valve-on duration (not the planned cap). See impl_roadmap.md 5.1.
+    mode: parallel
+    max: 4
+    trigger:
+      - platform: state
+        entity_id:
+          - switch.watering_system_relay_2_zone_1
+          - switch.watering_system_relay_3_zone_2
+          - switch.watering_system_relay_4_zone_3
+          - switch.watering_system_relay_5_zone_4
+        to: "on"
+        # Backstop = the SAME planned-runtime ceiling run_zone_sequence enforces,
+        # plus a +1 min GRACE. run_zone_sequence caps each zone at
+        # min(max_single_zone_runtime_min, 120) - the helper AND an absolute
+        # 120-min safety cap (zone_scripts.yaml, `[max_runtime_state | float, 120]
+        # | min`). KEEP IN SYNC: the absolute 120 is duplicated there and here
+        # (HA packages can't share a scalar without a helper entity) - change one,
+        # change both. We mirror that `min(helper, 120)` here: without it, a helper set
+        # above 120 (the input_number allows up to 180) would arm this backstop at
+        # helper+1 while a real run tops out at 121 min, letting a stuck valve flow
+        # tens of minutes past the true planned max before the safety net trips.
+        # The +1 min grace: a NORMAL full-runtime close elapses at exactly the
+        # capped value, and the HA relay-off event lags the internal `for:` timer
+        # by an ESPHome round-trip, so a boundary-equal timer could fire FIRST and
+        # raise a false "stuck valve" alarm on a healthy zone (and make the §2 test
+        # nondeterministic). The grace guarantees a normal close is off before the
+        # backstop; only a true overrun (valve still on > cap + 1 min) trips it.
+        # int(120) fallback: if the helper ever reads unavailable/unknown, DON'T
+        # collapse to `for: 1` min off a 0 base - fall back to the 120 min safety
+        # default (matching calculate_zone_runtime) before the min()/grace.
+        for:
+          minutes: >-
+            {{ ([states('input_number.max_single_zone_runtime_min') | int(120), 120]
+                | min) + 1 }}
+    condition:
+      # Every state EXCEPT manual_override (see header note).
+      - condition: template
+        value_template: >-
+          {{ not is_state('input_select.watering_system_state', 'manual_override') }}
+    action:
+      # Zone relays are switch.watering_system_relay_{N}_zone_{M} with M = N-1.
+      # Parse the zone_id (M) for the notify, and pre-compute the ENFORCED cap
+      # min(helper, 120) once - the SAME value the for: trigger uses, minus the
+      # +1 grace - so the alert states the real runtime limit, not the raw helper
+      # (a helper set >120 is capped to 120 by run_zone_sequence, so quoting the
+      # helper would misstate the limit that was actually enforced).
+      - variables:
+          zone_id: "{{ trigger.to_state.entity_id.split('_zone_')[1] | int }}"
+          capped_runtime: >-
+            {{ [states('input_number.max_single_zone_runtime_min') | int(120), 120] | min }}
+      # Close the stuck valve by turning off ITS relay DIRECTLY (the triggering
+      # entity), NOT via script.close_zone. close_zone is mode:single and this
+      # backstop is mode:parallel: two zones overrunning in the same instant
+      # (parallel sequencing arms their for: timers together) would issue
+      # coincident close_zone calls and HA would DROP the second (script already
+      # running), leaving that valve open - the exact failure this backstop
+      # exists to prevent. A direct switch.turn_off has no single-run lock. The
+      # triggering entity is always one of the fixed R2-R5 set, so close_zone's
+      # zone_id range validation is redundant here. (The normal watering path
+      # keeps using close_zone: its run_zone_sequence close_all_zones cleanup is
+      # a second net, which this standalone backstop does not have.)
+      - service: switch.turn_off
+        target:
+          entity_id: "{{ trigger.to_state.entity_id }}"
+      - service: script.send_high_notification
+        data:
+          # A stuck valve can occur while winterized; bypass the winter gate so
+          # the alert still reaches the operator (mirrors on_error / control-guard).
+          bypass_winterization: true
+          message: >-
+            Zone {{ zone_id }} valve exceeded the max single-zone runtime
+            ({{ capped_runtime }} min) and was force-closed. Check for a stuck
+            valve or a runaway sequence.

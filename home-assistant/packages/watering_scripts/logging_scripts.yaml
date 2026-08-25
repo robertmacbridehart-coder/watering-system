@@ -1,0 +1,101 @@
+# ============================================================================
+# Logging Scripts -- persistent system-event logging
+# ============================================================================
+# Location: home-assistant/packages/watering_scripts/logging_scripts.yaml
+#
+# Provides ONE reusable script, log_system_event, that every watering script
+# calls instead of writing system_log directly. It does two things:
+#   1. Writes to system_log (the free, always-available diagnostic channel).
+#   2. Fires the `watering_system_event` HA bus event, which the AppDaemon
+#      DbEventWriter app persists into the system_events table
+#      (docs/architecture.md Section 13.3.1, Event 5).
+#
+# This replaces the transient input_text.cycle_event_log with a durable,
+# queryable record. Scripts NEVER write the SQLite DB directly -- they only fire
+# the event -- so a DB problem can never stall the watering / safety path
+# (architecture.md Section 13.1).
+#
+# event_type convention: "<domain>_<event>", lower_snake_case. Domains:
+#   pump_*    pump / pressure-relief scripts   (pump_scripts.yaml)
+#   zone_*    zone valve scripts               (zone_scripts.yaml)
+#   safety_*  safety / emergency scripts       (watering_safety_scripts.yaml)
+# The `notes` and `entity_id` fields carry the specifics, so event_type stays a
+# coarse, easily-filtered class.
+#
+# severity is CHECK-constrained in the DB to info | warning | error | critical
+# (db_schema.sql), matching HA's system_log levels (minus debug), so the
+# system_log level equals the severity 1:1 (no lossy remap). Severity ladder:
+#   info     normal event (pump stopped, self-repair succeeded)
+#   warning  recoverable / degraded (self-repair attempt, config fallback, clamp)
+#   error    operation aborted / failed but contained (interlock, tank low, relay verify)
+#   critical catastrophic, needs physical intervention (pump runaway)
+# ============================================================================
+
+script:
+  log_system_event:
+    alias: "Log System Event"
+    description: >-
+      Write one system event to system_log AND persist it to the watering_ops
+      system_events table via the watering_system_event bus event.
+    icon: mdi:database-plus
+    # parallel: safety scripts may log from concurrent zone/pump sequences.
+    mode: parallel
+    max: 20
+    fields:
+      severity:
+        description: "info | warning | critical"
+        example: "critical"
+        required: true
+      event_type:
+        description: "Coarse event class, e.g. pump_start_abort"
+        example: "pump_start_abort"
+        required: true
+      message:
+        description: "Human-readable detail (-> system_log and DB notes column)"
+        example: "Cannot start pump: tank level low-low"
+        required: true
+      entity_id:
+        description: "HA entity involved, if any"
+        example: "switch.watering_system_relay_1_main_pump"
+        required: false
+      value_before:
+        description: "State/value before the event, if relevant"
+        required: false
+      value_after:
+        description: "State/value after the event, if relevant"
+        required: false
+      logger:
+        description: "system_log logger name"
+        example: "watering_system.pump_scripts"
+        required: false
+    sequence:
+      # Normalise severity to the DB vocabulary; anything unexpected becomes
+      # 'warning' so a caller typo still produces a usable, non-rejected row.
+      # Derive the system_log level from the (normalised) severity.
+      - variables:
+          severity_norm: >-
+            {{ severity if severity in ['info', 'warning', 'error', 'critical']
+               else 'warning' }}
+          # DB severity matches HA's system_log levels 1:1, so no remap needed.
+          log_level: "{{ severity_norm }}"
+          event_ts: "{{ utcnow().strftime('%Y-%m-%d %H:%M:%S') }}"
+          logger_name: "{{ logger | default('watering_system.events', true) }}"
+
+      # 1) system_log -- always works, independent of the DB.
+      - service: system_log.write
+        data:
+          message: "{{ message }}"
+          level: "{{ log_level }}"
+          logger: "{{ logger_name }}"
+
+      # 2) Fire the bus event the AppDaemon DbEventWriter persists. Absent
+      #    optional fields are sent as '' and normalised to NULL by the writer.
+      - event: watering_system_event
+        event_data:
+          timestamp: "{{ event_ts }}"
+          event_type: "{{ event_type }}"
+          severity: "{{ severity_norm }}"
+          entity_id: "{{ entity_id | default('', true) }}"
+          value_before: "{{ value_before | default('', true) }}"
+          value_after: "{{ value_after | default('', true) }}"
+          notes: "{{ message }}"

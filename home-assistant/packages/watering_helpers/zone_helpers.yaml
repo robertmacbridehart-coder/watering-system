@@ -1,0 +1,1828 @@
+###############################################################################
+# Watering System - Per-Zone Configuration Helpers
+#
+# File: home-assistant/packages/watering_helpers/zone_helpers.yaml
+# Purpose: Per-zone settings for weather-based watering program selection
+#          and runtime calculations
+#
+# Entity Count: 172 helpers
+#   - 4 input_text (friendly names)
+#   - 8 input_boolean (4 allow_full_dose_light_program + 4 zone_enabled, per zone)
+#   - 8 input_select (4 season + 4 program)
+#   - 152 input_number (4 base runtime + 4 watering interval + 80 seasonal weather
+#                       thresholds + 48 seasonal soil moisture thresholds +
+#                       16 fert 14d targets)
+#
+# Zone Assignments:
+#   - Zone 1: Raspberries (berry canes, moderate water needs)
+#   - Zone 2: Blueberries (shallow roots, higher water needs)
+#   - Zone 3: TBD (placeholder for future crop)
+#   - Zone 4: TBD (placeholder for future crop)
+#
+# Friendly Naming Strategy:
+#   - Base name stored in input_text.zone_{id}_friendly_name
+#   - All other helpers use Jinja templates to reference base name
+#   - Allows changing zone assignment without editing 70+ friendly names
+#
+# Weather Evaluation Logic (window_check state):
+#   if rain_72h > rain_off_mm: program = off
+#   elif rain_24h > rain_light_mm: program = light
+#   elif temp_avg_3day > temp_heavy_c AND rain_72h < rain_min_mm: program = heavy
+#   elif temp_avg_3day > temp_normal_c: program = normal
+#   else: program = light
+#
+# Last Updated: 2025-10-14
+###############################################################################
+
+# ============================================================================
+# Friendly Name Helpers
+# ============================================================================
+input_text:
+  zone_1_friendly_name:
+    name: "Zone 1 Friendly Name"
+    initial: "Raspberries"
+    icon: mdi:fruit-cherries
+    max: 30
+
+  zone_2_friendly_name:
+    name: "Zone 2 Friendly Name"
+    initial: "Blueberries"
+    icon: mdi:fruit-cherries
+    max: 30
+
+  zone_3_friendly_name:
+    name: "Zone 3 Friendly Name"
+    initial: "Zone 3"
+    icon: mdi:sprout
+    max: 30
+
+  zone_4_friendly_name:
+    name: "Zone 4 Friendly Name"
+    initial: "Zone 4"
+    icon: mdi:sprout
+    max: 30
+
+# ============================================================================
+# Fertigation Light Program Behavior Control
+# ============================================================================
+# Purpose: Control whether zone receives full or proportional fertilizer dose
+#          during light watering programs (50% runtime)
+#
+# Logic:
+#   IF zone_program == "light" AND boolean == ON:
+#     dose_multiplier = 1.0  (Full dose: 100% fert in 50% water = 2x concentration)
+#   IF zone_program == "light" AND boolean == OFF:
+#     dose_multiplier = 0.5  (Proportional: 50% fert in 50% water = same concentration)
+#
+# Safety: Defaults to OFF (conservative proportional dosing)
+#         Only enable for salt-tolerant crops (raspberries, vegetables)
+#         Keep OFF for salt-sensitive crops (blueberries, azaleas, rhododendrons)
+#
+# Warning: Enabling this setting doubles fertilizer concentration during light programs
+#          Inappropriate for ericaceous (acid-loving) plants
+# ============================================================================
+
+input_boolean:
+  zone_1_allow_full_dose_light_program:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Allow Full Dose in Light Program"
+    icon: mdi:beaker-alert
+    initial: false
+
+  zone_2_allow_full_dose_light_program:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Allow Full Dose in Light Program"
+    icon: mdi:beaker-alert
+    initial: false  # Blueberries/lingonberries are salt-sensitive
+
+  zone_3_allow_full_dose_light_program:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Allow Full Dose in Light Program"
+    icon: mdi:beaker-alert
+    initial: false
+
+  zone_4_allow_full_dose_light_program:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Allow Full Dose in Light Program"
+    icon: mdi:beaker-alert
+    initial: false
+
+  # ==========================================================================
+  # Per-Zone Master Enable (hard on/off)
+  # ==========================================================================
+  # ON  = zone participates in cycles normally.
+  # OFF = zone is removed from EVERY cycle - state_window_check forces its
+  #       program to 'off', which zeroes both watering runtime AND the fert
+  #       dose multiplier. This is a durable operator override: unlike selecting
+  #       'off' in zone_N_program (which the weather tree overwrites every
+  #       window), this boolean is honoured on every evaluation until turned
+  #       back on.
+  #
+  # NO initial: - RestoreEntity so an operator's disable survives an HA restart
+  # (ADR-017 no-`initial:` rule). First boot with no stored state falls back to
+  # OFF = disabled = no water, the fail-safe / opt-in direction shared with the
+  # enable_*_window booleans. NOTE: at go-live each zone must be explicitly
+  # enabled once (they come up OFF on the first boot after this helper is added).
+  # ==========================================================================
+  zone_1_enabled:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Zone Enabled"
+    icon: mdi:power
+
+  zone_2_enabled:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Zone Enabled"
+    icon: mdi:power
+
+  zone_3_enabled:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Zone Enabled"
+    icon: mdi:power
+
+  zone_4_enabled:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Zone Enabled"
+    icon: mdi:power
+
+# ============================================================================
+# Zone Season and Program Selection
+# ============================================================================
+input_select:
+  # --- Season Selectors ---
+  zone_1_season:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    # NO initial: - RestoreEntity so the operator's season selection survives a
+    # restart instead of snapping back to spring (spring in mid-August applied the
+    # wrong seasonal thresholds - found 2026-08-18). Nothing auto-sets season, so
+    # an initial: made it silently revert on every restart. First boot with no
+    # stored state falls back to options[0] = spring. See ADR-017 + the
+    # zone_sequencing_mode note.
+
+  zone_2_season:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    # NO initial: - RestoreEntity, same as zone_1_season (2026-08-18).
+
+  zone_3_season:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    # NO initial: - RestoreEntity, same as zone_1_season (2026-08-18).
+
+  zone_4_season:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Current Season"
+    icon: mdi:calendar-range
+    options:
+      - spring
+      - summer
+      - fall
+      - winter
+    # NO initial: - RestoreEntity, same as zone_1_season (2026-08-18).
+
+  # --- Program Overrides ---
+  # 'booster' is the mid-interval heavy top-up (0.5x base runtime) placed by
+  # state_window_check at the interval midpoint - it is a SYSTEM-set value, not
+  # an operator selection, but must be a listed option so window_check can set
+  # it. calculate_zone_runtime maps it to 0.5x; at the DB boundary
+  # (fire_zone_run_complete) it is recorded as weather_program='heavy' with
+  # program_multiplier=0.5 so the schema's CHECK vocabulary is unchanged.
+  zone_1_program:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Watering Program"
+    icon: mdi:water
+    options:
+      - "off"
+      - light
+      - normal
+      - heavy
+      - booster
+    initial: normal
+
+  zone_2_program:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Watering Program"
+    icon: mdi:water
+    options:
+      - "off"
+      - light
+      - normal
+      - heavy
+      - booster
+    initial: normal
+
+  zone_3_program:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Watering Program"
+    icon: mdi:water
+    options:
+      - "off"
+      - light
+      - normal
+      - heavy
+      - booster
+    initial: normal
+
+  zone_4_program:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Watering Program"
+    icon: mdi:water
+    options:
+      - "off"
+      - light
+      - normal
+      - heavy
+      - booster
+    initial: normal
+
+# ============================================================================
+# Zone Runtime Configuration
+# ============================================================================
+input_number:
+  # --- Base Runtimes ---
+  zone_1_base_runtime_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_2_base_runtime_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_3_base_runtime_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  zone_4_base_runtime_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Base Runtime"
+    icon: mdi:timer
+    min: 1
+    max: 120
+    step: 1
+    initial: 30
+    unit_of_measurement: "min"
+    mode: box
+
+  # --- Per-Zone Watering Interval (cadence gate) ---
+  # N = "water on the Nth day": the zone runs a MAIN dose once every N days,
+  # measured from its last main dose (sensor.zone_N_watering, which excludes the
+  # heavy mid-interval booster). Consumed by state_window_check; replaces the
+  # retired system-wide input_number.watering_cycle_days (ADR-015 D-C closed).
+  # A heavy program adds a 0.5x booster at the interval midpoint (N/2 days).
+  #
+  # NO initial: - RestoreEntity so an operator's per-crop cadence survives a
+  # restart (ADR-017; same class as zone_N_season). First boot with no stored
+  # state falls back to `min` = 1 day, but that is moot on a fresh system because
+  # zone_N_enabled comes up OFF (no watering until the zone is enabled).
+  zone_1_watering_interval_days:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Watering Interval"
+    icon: mdi:calendar-clock
+    min: 1
+    max: 14
+    step: 1
+    unit_of_measurement: "days"
+    mode: box
+
+  zone_2_watering_interval_days:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Watering Interval"
+    icon: mdi:calendar-clock
+    min: 1
+    max: 14
+    step: 1
+    unit_of_measurement: "days"
+    mode: box
+
+  zone_3_watering_interval_days:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Watering Interval"
+    icon: mdi:calendar-clock
+    min: 1
+    max: 14
+    step: 1
+    unit_of_measurement: "days"
+    mode: box
+
+  zone_4_watering_interval_days:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Watering Interval"
+    icon: mdi:calendar-clock
+    min: 1
+    max: 14
+    step: 1
+    unit_of_measurement: "days"
+    mode: box
+
+  # ==========================================================================
+  # Zone 1 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_1_spring_rain_off_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_rain_light_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_rain_min_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_spring_temp_heavy_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_spring_temp_normal_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_spring_off_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_spring_light_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_spring_normal_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_1_summer_rain_off_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_rain_light_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_rain_min_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_summer_temp_heavy_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_summer_temp_normal_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_summer_off_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 70
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_summer_light_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 60
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_summer_normal_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 45
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_1_fall_rain_off_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_rain_light_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_rain_min_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_fall_temp_heavy_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_fall_temp_normal_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_fall_off_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_fall_light_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_fall_normal_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_1_winter_rain_off_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_rain_light_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_rain_min_mm:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_1_winter_temp_heavy_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_winter_temp_normal_c:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_1_winter_off_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 80
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_winter_light_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 50
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_1_winter_normal_moisture_min:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 35
+    unit_of_measurement: "%"
+    mode: box
+
+  # ==========================================================================
+  # Zone 2 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_2_spring_rain_off_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_rain_light_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_rain_min_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_spring_temp_heavy_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_spring_temp_normal_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_spring_off_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_spring_light_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_spring_normal_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_2_summer_rain_off_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_rain_light_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_rain_min_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_summer_temp_heavy_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_summer_temp_normal_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_summer_off_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 70
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_summer_light_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 60
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_summer_normal_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 45
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_2_fall_rain_off_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_rain_light_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_rain_min_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_fall_temp_heavy_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_fall_temp_normal_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_fall_off_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_fall_light_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_fall_normal_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_2_winter_rain_off_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_rain_light_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_rain_min_mm:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_2_winter_temp_heavy_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_winter_temp_normal_c:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_2_winter_off_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 80
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_winter_light_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 50
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_2_winter_normal_moisture_min:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 35
+    unit_of_measurement: "%"
+    mode: box
+
+  # ==========================================================================
+  # Zone 3 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_3_spring_rain_off_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_rain_light_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_rain_min_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_spring_temp_heavy_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_spring_temp_normal_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_spring_off_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_spring_light_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_spring_normal_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_3_summer_rain_off_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_rain_light_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_rain_min_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_summer_temp_heavy_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_summer_temp_normal_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_summer_off_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 70
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_summer_light_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 60
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_summer_normal_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 45
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_3_fall_rain_off_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_rain_light_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_rain_min_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_fall_temp_heavy_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_fall_temp_normal_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_fall_off_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_fall_light_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_fall_normal_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_3_winter_rain_off_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_rain_light_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_rain_min_mm:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_3_winter_temp_heavy_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_winter_temp_normal_c:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_3_winter_off_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 80
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_winter_light_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 50
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_3_winter_normal_moisture_min:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 35
+    unit_of_measurement: "%"
+    mode: box
+
+  # ==========================================================================
+  # Zone 4 Seasonal Thresholds
+  # ==========================================================================
+
+  # --- Spring Thresholds ---
+  zone_4_spring_rain_off_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 20
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_rain_light_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_rain_min_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 5
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_spring_temp_heavy_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 28
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_spring_temp_normal_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 22
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_spring_off_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_spring_light_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_spring_normal_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Summer Thresholds ---
+  zone_4_summer_rain_off_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_rain_light_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 8
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_rain_min_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 3
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_summer_temp_heavy_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 30
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_summer_temp_normal_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_summer_off_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 70
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_summer_light_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 60
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_summer_normal_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 45
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Fall Thresholds ---
+  zone_4_fall_rain_off_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 25
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_rain_light_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 12
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_rain_min_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 7
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_fall_temp_heavy_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 25
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_fall_temp_normal_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 18
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_fall_off_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 75
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_fall_light_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 55
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_fall_normal_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 40
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Winter Thresholds ---
+  zone_4_winter_rain_off_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter: Rain Off Threshold"
+    icon: mdi:weather-pouring
+    min: 0
+    max: 100
+    step: 1
+    initial: 30
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_rain_light_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter: Rain Light Threshold"
+    icon: mdi:weather-rainy
+    min: 0
+    max: 50
+    step: 1
+    initial: 15
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_rain_min_mm:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter: Rain Minimum (for Heavy)"
+    icon: mdi:water-minus
+    min: 0
+    max: 20
+    step: 1
+    initial: 10
+    unit_of_measurement: "mm"
+    mode: box
+
+  zone_4_winter_temp_heavy_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter: Temp Heavy Threshold"
+    icon: mdi:thermometer-high
+    min: 15
+    max: 40
+    step: 1
+    initial: 20
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_winter_temp_normal_c:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter: Temp Normal Threshold"
+    icon: mdi:thermometer
+    min: 10
+    max: 35
+    step: 1
+    initial: 15
+    unit_of_measurement: "°C"
+    mode: box
+
+  zone_4_winter_off_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter Off Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 80
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_winter_light_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter Light Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 50
+    unit_of_measurement: "%"
+    mode: box
+
+  zone_4_winter_normal_moisture_min:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter Normal Moisture Min"
+    icon: mdi:water-percent
+    min: 0
+    max: 100
+    step: 5
+    initial: 35
+    unit_of_measurement: "%"
+    mode: box
+
+  # ============================================================================
+  # Fertigation Frequency Targets (Rolling 14-Day Window)
+  # ============================================================================
+  # Purpose: Define target number of fertigation events per 14-day rolling window
+  # Logic: Used in window_check state to determine if fertigation is due
+  #   if events_last_14_days < target: fertigation eligible (subject to other conditions)
+  # Tracking: Uses history_stats sensor counting fertigation state occurrences
+  # Reuse: Combined with soil moisture and weather thresholds for trigger decision
+  # ============================================================================
+
+  # ==========================================================================
+  # Zone 1 - Fertigation 14-Day Targets
+  # ==========================================================================
+
+  zone_1_spring_fert_14d_target:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Spring Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 5
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_1_summer_fert_14d_target:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Summer Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 7
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_1_fall_fert_14d_target:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Fall Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 3
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_1_winter_fert_14d_target:
+    name: "{{states('input_text.zone_1_friendly_name')}} - Winter Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 0
+    unit_of_measurement: "events"
+    mode: box
+
+  # ==========================================================================
+  # Zone 2 - Fertigation 14-Day Targets
+  # ==========================================================================
+
+  zone_2_spring_fert_14d_target:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Spring Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 5
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_2_summer_fert_14d_target:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Summer Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 7
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_2_fall_fert_14d_target:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Fall Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 3
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_2_winter_fert_14d_target:
+    name: "{{states('input_text.zone_2_friendly_name')}} - Winter Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 0
+    unit_of_measurement: "events"
+    mode: box
+
+  # ==========================================================================
+  # Zone 3 - Fertigation 14-Day Targets
+  # ==========================================================================
+
+  zone_3_spring_fert_14d_target:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Spring Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 5
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_3_summer_fert_14d_target:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Summer Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 7
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_3_fall_fert_14d_target:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Fall Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 3
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_3_winter_fert_14d_target:
+    name: "{{states('input_text.zone_3_friendly_name')}} - Winter Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 0
+    unit_of_measurement: "events"
+    mode: box
+
+  # ==========================================================================
+  # Zone 4 - Fertigation 14-Day Targets
+  # ==========================================================================
+
+  zone_4_spring_fert_14d_target:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Spring Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 5
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_4_summer_fert_14d_target:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Summer Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 7
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_4_fall_fert_14d_target:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Fall Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 3
+    unit_of_measurement: "events"
+    mode: box
+
+  zone_4_winter_fert_14d_target:
+    name: "{{states('input_text.zone_4_friendly_name')}} - Winter Fert Target (14d)"
+    icon: mdi:calendar-sync
+    min: 0
+    max: 14
+    step: 1
+    initial: 0
+    unit_of_measurement: "events"
+    mode: box

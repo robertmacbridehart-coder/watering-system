@@ -1,0 +1,745 @@
+# ============================================================================
+# State Machine Scripts - Phase 4
+# ============================================================================
+# Location: home-assistant/packages/watering_state/state_scripts.yaml
+#
+# Home of the plain-watering state machine's scripts (ADR-015):
+#   Shared reporting/cleanup:
+#     - finalize_cycle_record  (D3: Event 4 + clear cycle_uuid; report-only)
+#     - abort_cycle_scripts    (A2: turn_off the in-flight state_* progression)
+#   State transition scripts (each self-advances at its tail; A1-guarded):
+#     - state_window_check      (6.2 weather tree -> per-zone program; D-A)
+#     - state_preflight_check   (tank/ESP32/control gates; mint cycle_uuid +
+#                                Event 1; D-B/D-G)
+#     - state_watering_plain    (R6/R7 interlock -> pump -> zones -> stop)
+#     - state_post_cycle_relief (relief cycle -> R10 off -> finalize -> idle)
+#
+# Design references: ADR-015 (D1-D4 + D-A..D-H, A1/A2) and the Event 4 payload
+# schema in architecture.md Section 13.3.1.
+#
+# TWO CORRECTNESS RULES for every state_* script (added in Step 4), recorded
+# here for context:
+#   A1  guard-the-advance: only set the next state if still in my own state.
+#   -   never continue_on_error around safety-critical subscripts.
+# The two scripts below are NOT state_* scripts and are exempt from A1 (they
+# never advance the machine) - but they are the machinery A2 and D3 rely on.
+# ============================================================================
+
+script:
+  # ==========================================================================
+  # finalize_cycle_record  -  reporting-layer cleanup ONLY (ADR-015 D3)
+  # ==========================================================================
+  # Fires Event 4 (watering_cycle_complete) from input_text.cycle_uuid, then
+  # clears the helper. This is the SOLE closer of the watering_cycles row that
+  # Event 1 opened, so every cycle-ending path (normal completion, error,
+  # restart-recovery, future safe-stop) calls it exactly once - see the
+  # "cycle row always closes" invariant.
+  #
+  # HARD BOUNDARY (D3): strictly DB + cycle-sensor bookkeeping. It MUST NEVER
+  #   - run pressure relief or stop/actuate any hardware, or
+  #   - set input_select.watering_system_state.
+  # emergency_stop / safe_shutdown keep sole ownership of hardware safing and
+  # state latching; the per-error automations call THIS afterwards only to tidy
+  # the report. Keeping it off the hardware/state path means a DB hiccup can
+  # never stall watering or safety (architecture.md Section 13.1).
+  #
+  # NO-OP when no cycle is open: input_text.cycle_uuid empty (also treats
+  # unknown/unavailable as "no cycle"). cycle_uuid is the state machine's own
+  # source of truth for "a cycle is open"; binary_sensor.watering_cycle_active
+  # is the AppDaemon-owned mirror (Event 1 -> on, Event 4 -> off) and is not
+  # gated on here because no publisher exists yet (roadmap follow-up #3) and it
+  # would only ever agree with cycle_uuid.
+  #
+  # Parameters:
+  #   outcome (required): completed | aborted | error  (Event 4 controlled
+  #     vocabulary; anything else is normalised to 'error' so a caller typo
+  #     still produces a valid, non-rejected row).
+  #   notes   (optional): free text -> Event 4 notes (empty -> NULL by writer).
+  #
+  # mode: single - instantaneous (no delays); a concurrent second call would
+  # simply find cycle_uuid already cleared and no-op, so dropping it is safe.
+  # ==========================================================================
+  finalize_cycle_record:
+    alias: "Finalize Cycle Record"
+    icon: mdi:database-check
+    mode: single
+    fields:
+      outcome:
+        description: "Cycle outcome: completed | aborted | error"
+        example: "completed"
+        required: true
+      notes:
+        description: "Optional free-text note stored on the cycle row"
+        example: "post-cycle relief complete"
+        required: false
+    sequence:
+      - variables:
+          cycle_uuid_val: "{{ states('input_text.cycle_uuid') }}"
+
+      # No open cycle -> nothing to close. Silent no-op (this is a normal,
+      # expected call from every error / restart / safe-stop path). A cycle is
+      # open iff cycle_uuid carries a real minted id; test the documented 'c-'
+      # uuid-format invariant (config_helpers.yaml) rather than a multi-value
+      # sentinel list. The same check lives in fire_zone_run_complete
+      # (zone_scripts.yaml); both key off the single 'c-' format constant.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not (cycle_uuid_val | string).startswith('c-') }}
+        then:
+          - stop: "No open cycle - finalize_cycle_record is a no-op"
+
+      - variables:
+          end_time: "{{ utcnow().strftime('%Y-%m-%d %H:%M:%S') }}"
+          outcome_norm: >-
+            {{ outcome if outcome in ['completed', 'aborted', 'error']
+               else 'error' }}
+
+      # Event 4 -> AppDaemon UPDATEs the watering_cycles row and turns
+      # binary_sensor.watering_cycle_active off (architecture.md Section 13.3.1).
+      # Absent optional 'notes' is sent as '' and normalised to NULL by the writer.
+      - event: watering_cycle_complete
+        event_data:
+          cycle_uuid: "{{ cycle_uuid_val }}"
+          end_time: "{{ end_time }}"
+          outcome: "{{ outcome_norm }}"
+          notes: "{{ notes | default('', true) }}"
+
+      # Clear the helper AFTER firing so the uuid was still present in the event.
+      # An empty cycle_uuid is the no-op signal for the next caller.
+      - service: input_text.set_value
+        target:
+          entity_id: input_text.cycle_uuid
+        data:
+          value: ""
+
+  # ==========================================================================
+  # abort_cycle_scripts  -  prompt cancellation of the progression (ADR-015 A2)
+  # ==========================================================================
+  # script.turn_off the in-flight state_* progression scripts so a long delay
+  # (chiefly the per-zone runtime waits, now held inside water_one_zone) stops
+  # promptly instead of running to completion and then advancing the machine.
+  # Called BEFORE safe_shutdown by the five per-error automations, restart
+  # recovery, and the D-F control-state guards.
+  #
+  # HA script.turn_off does NOT cascade to subscripts. §2.1: rather than a
+  # hand-maintained allow-list (which a newly added state_* script could
+  # silently fall out of sync with), the target set is DERIVED dynamically from
+  # the script registry by naming convention - every `script.state_*` - plus the
+  # two non-state_ delay-bearing scripts run_zone_sequence and water_one_zone.
+  # Adding a new state_* script needs no edit here.
+  #
+  # NEVER matches teardown/reporting scripts (their names don't start with
+  # `state_`), which must not be turned off here: safe_shutdown, emergency_stop,
+  # stop_main_pump, close_all_zones, close_pressure_relief, finalize_cycle_record,
+  # fire_zone_run_complete, log_system_event.
+  #
+  # BEST-EFFORT: correctness is owned by the A1 guard-the-advance rule in each
+  # state_* script, so even a missed target only leaves a harmless delay running
+  # to completion (A1 stops it from clobbering the latched error state). Hence no
+  # logging and no error handling - this is pure mechanical cleanup. turn_off
+  # tolerates an empty list and not-yet-running / not-yet-existing targets.
+  #
+  # mode: single - instantaneous; a duplicate concurrent call is a harmless
+  # repeat of the same turn_off set.
+  # ==========================================================================
+  abort_cycle_scripts:
+    alias: "Abort Cycle Scripts"
+    icon: mdi:cancel
+    mode: single
+    sequence:
+      - variables:
+          # All state_* progression scripts (by convention) + the two non-state_
+          # delay-bearing scripts: run_zone_sequence and water_one_zone. The latter
+          # holds each zone's runtime delay, so it MUST be cancellable here or an
+          # aborted zone would run to completion and fire a spurious Event 3.
+          progression_scripts: >-
+            {{ (states.script
+                | map(attribute='entity_id')
+                | select('match', 'script\\.state_')
+                | list) + ['script.run_zone_sequence', 'script.water_one_zone'] }}
+      - service: script.turn_off
+        target:
+          entity_id: "{{ progression_scripts }}"
+
+  # ==========================================================================
+  # state_window_check  -  evaluate weather -> per-zone program (Phase 4)
+  # ==========================================================================
+  # Entry: dispatched when watering_system_state -> window_check (scheduler set
+  # active_watering_window / active_trigger_type first).
+  #
+  # Sets input_select.zone_N_program (off/light/normal/heavy/booster) for all
+  # four zones: the architecture.md 6.2 weather tree wrapped by the per-zone
+  # ENABLE gate (zone_N_enabled), the CADENCE gate (zone_N_watering_interval_days
+  # measured from sensor.zone_N_watering), and the heavy mid-interval BOOSTER
+  # (0.5x). See the per-zone `programs` block below for the full layering. Then:
+  #   - all four zones 'off'  -> back to idle (nothing due today)
+  #   - otherwise             -> preflight_check
+  #
+  # D-A (weather unavailable): if any of the three weather inputs is unreadable,
+  # fall back to program 'normal' for every zone and log a warning - never abort
+  # the cycle on a missing API read, never blind-water 'heavy'.
+  #
+  # A1 (guard-the-advance): the final state change only fires if we are still in
+  # window_check. Setting zone programs is always safe (config output), so only
+  # the transition is guarded.
+  # ==========================================================================
+  state_window_check:
+    alias: "State: Window Check"
+    icon: mdi:weather-partly-rainy
+    mode: single
+    sequence:
+      - variables:
+          rain_24h_raw: "{{ states('sensor.brightsky_rain_24h') }}"
+          rain_72h_raw: "{{ states('sensor.brightsky_rain_72h') }}"
+          temp_avg_raw: "{{ states('sensor.brightsky_temp_avg_high_3day') }}"
+          # §3.1: reuse the _raw captures above (variables render top-to-bottom,
+          # so each is in scope for the next) - one read per sensor, not two, and
+          # the availability check and the float cast see the same value.
+          weather_available: >-
+            {{ is_number(rain_24h_raw) and is_number(rain_72h_raw)
+               and is_number(temp_avg_raw) }}
+          rain_24h: "{{ rain_24h_raw | float(0) }}"
+          rain_72h: "{{ rain_72h_raw | float(0) }}"
+          temp_avg_3day: "{{ temp_avg_raw | float(0) }}"
+
+      # D-A: warn (once) when weather is unreadable; all zones will default normal.
+      - if:
+          - condition: template
+            value_template: "{{ not weather_available }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: state_window_check
+              message: >-
+                Weather inputs unavailable (rain_24h={{ rain_24h_raw }},
+                rain_72h={{ rain_72h_raw }}, temp_avg_high_3day={{ temp_avg_raw }}).
+                Falling back to program 'normal' for all zones (D-A).
+              logger: watering_system.state_scripts
+
+      # Compute each zone's FINAL program. The architecture.md 6.2 weather tree
+      # (-> wp: off/light/normal/heavy) is wrapped by two cadence layers:
+      #   (1) ENABLE gate  - input_boolean.zone_N_enabled OFF -> 'off'. A durable
+      #       operator disable (unlike selecting 'off' in zone_N_program, which
+      #       this script overwrites every window). Zeroes watering AND fert.
+      #   (2) CADENCE gate - a zone runs a MAIN dose only when DUE: days since its
+      #       last MAIN dose (sensor.zone_N_watering, which excludes the booster)
+      #       >= its per-zone interval N. A due day the weather tree resolves to
+      #       'off' (recent rain) is NOT consumed - the anchor is unchanged, so
+      #       the zone stays overdue and retries every window until it waters.
+      #   (3) HEAVY BOOSTER - a heavy zone also runs a 0.5x 'booster' from the
+      #       interval midpoint (N/2 days after the last main dose) onward, ALWAYS
+      #       in the EVENING window (fallback morning only if evening is disabled).
+      #       There is NO odd/even parity branch and NO 'afternoon' window (options
+      #       are morning/evening): the odd-vs-even midpoint difference is absorbed
+      #       naturally by the day granularity of the [mid, N) band. It RETRIES on
+      #       each target window from mid until the next main dose while still
+      #       PENDING (no booster since the last main dose - compared via
+      #       sensor.zone_N_last_booster vs sensor.zone_N_watering) and
+      #       RE-EVALUATES the weather each time: it fires exactly once per
+      #       interval, only if still 'heavy', and a missed evening is picked up on
+      #       a later one (ADR-020 Fix #4b). The N==1 + single-window collision
+      #       (booster slot == main slot) schedules NO booster; calculate_zone_runtime
+      #       delivers a single 1.5x dose there instead.
+      # Weather thresholds default to values that resolve to 'normal' if a helper
+      # is unreadable, so a missing config never forces 'off' or 'heavy'. The
+      # cadence helpers default safely too: interval -> 3, missing last-water ->
+      # treated as overdue (a never-watered zone seeds its anchor by watering).
+      - variables:
+          morning_en: "{{ is_state('input_boolean.enable_morning_window', 'on') }}"
+          evening_en: "{{ is_state('input_boolean.enable_evening_window', 'on') }}"
+          active_window: "{{ states('input_select.active_watering_window') }}"
+          programs: >-
+            {% set ns = namespace(r=[]) %}
+            {% set single_window = (morning_en and not evening_en)
+                                   or (evening_en and not morning_en) %}
+            {% for z in [1, 2, 3, 4] %}
+              {% set season = states('input_select.zone_' ~ z ~ '_season') %}
+              {% set roff = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_off_mm') | float(999) %}
+              {% set rlight = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_light_mm') | float(999) %}
+              {% set rmin = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_min_mm') | float(0) %}
+              {% set theavy = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_temp_heavy_c') | float(999) %}
+              {% set tnormal = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_temp_normal_c') | float(0) %}
+              {# ---- architecture.md 6.2 weather tree -> wp ---- #}
+              {% if not weather_available %}
+                {% set wp = 'normal' %}
+              {% elif rain_72h > roff %}
+                {% set wp = 'off' %}
+              {% elif rain_24h > rlight %}
+                {% set wp = 'light' %}
+              {% elif temp_avg_3day > theavy and rain_72h < rmin %}
+                {% set wp = 'heavy' %}
+              {% elif temp_avg_3day > tnormal %}
+                {% set wp = 'normal' %}
+              {% else %}
+                {% set wp = 'light' %}
+              {% endif %}
+              {# ---- cadence inputs ---- #}
+              {% set enabled = is_state('input_boolean.zone_' ~ z ~ '_enabled', 'on') %}
+              {% set n = states('input_number.zone_' ~ z ~ '_watering_interval_days') | int(3) %}
+              {% set last = states('sensor.zone_' ~ z ~ '_watering') %}
+              {% set has_last = last not in ['unknown', 'unavailable', 'none', ''] %}
+              {% set days_since = ((now() - as_datetime(last)).total_seconds() / 86400)
+                                  if has_last else 9999 %}
+              {% set due = days_since >= n %}
+              {% set mid = n / 2 %}
+              {% set target = 'evening' if evening_en else 'morning' %}
+              {# BOOSTER RETRY (ADR-020 Fix #4b): fire on the target window any time
+                 from the midpoint up to the next main dose (mid <= days_since < N),
+                 but only while the booster is still PENDING for this interval - no
+                 booster recorded since the last main dose. This retries a missed
+                 booster on later target windows yet lands exactly once per interval,
+                 replacing the former single-shot [mid, mid+1) band. #}
+              {% set last_booster = states('sensor.zone_' ~ z ~ '_last_booster') %}
+              {% set has_booster = last_booster not in ['unknown', 'unavailable', 'none', ''] %}
+              {% set booster_pending = (not has_booster)
+                                       or (has_last and as_datetime(last_booster) < as_datetime(last)) %}
+              {% set in_band = has_last and days_since >= mid and days_since < n %}
+              {% set booster_slot = in_band and active_window == target
+                                    and booster_pending
+                                    and not (single_window and n == 1) %}
+              {# ---- layer the gates (order matters) ---- #}
+              {% if not enabled %}
+                {% set p = 'off' %}
+              {% elif wp == 'off' %}
+                {% set p = 'off' %}
+              {% elif due %}
+                {% set p = wp %}
+              {% elif booster_slot and wp == 'heavy' %}
+                {% set p = 'booster' %}
+              {% else %}
+                {% set p = 'off' %}
+              {% endif %}
+              {% set ns.r = ns.r + [p] %}
+            {% endfor %}
+            {{ ns.r }}
+
+      - repeat:
+          for_each:
+            - 1
+            - 2
+            - 3
+            - 4
+          sequence:
+            - service: input_select.select_option
+              target:
+                entity_id: "input_select.zone_{{ repeat.item }}_program"
+              data:
+                option: "{{ programs[repeat.item | int - 1] }}"
+
+      - variables:
+          all_off: "{{ programs | reject('eq', 'off') | list | length == 0 }}"
+
+      # A1 guard: only advance if a parallel safety/control event hasn't moved us.
+      - if:
+          - condition: template
+            value_template: "{{ is_state('input_select.watering_system_state', 'window_check') }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ all_off }}"
+            then:
+              - service: script.log_system_event
+                data:
+                  severity: info
+                  event_type: state_window_check
+                  message: "All zones resolved to 'off' - nothing due. Returning to idle."
+                  logger: watering_system.state_scripts
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: idle
+            else:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: preflight_check
+
+  # ==========================================================================
+  # state_preflight_check  -  gate the cycle, open the DB row (Phase 4)
+  # ==========================================================================
+  # Entry: dispatched when watering_system_state -> preflight_check.
+  #
+  # Checks (fail -> set error state [unless already errored] + stop):
+  #   1. Tank: plain watering gates on Low-Low (architecture.md 2.2). Sensor
+  #      unavailable -> error_comms_lost (D-G); Low-Low ON -> error_tank_low.
+  #   2. ESP32 online: R1 (main pump relay) availability is the proxy - all
+  #      relays share the one ESP32/WiFi link. Unavailable -> error_comms_lost.
+  #   3. Control booleans: manual_override_active / system_winterized OFF. If
+  #      either is ON, abort quietly to idle (the D-F guard automations own
+  #      engagement; the scheduler already gates, this is defence in depth).
+  #
+  # On pass: mint cycle_uuid (ADR-014), fire Event 1 (watering_preflight_complete),
+  # advance to watering_plain (D-B: fert path deferred, so plain always).
+  #
+  # A1 guard wraps the mint+Event1+advance so we never open a cycle row after a
+  # parallel event has taken over.
+  # ==========================================================================
+  state_preflight_check:
+    alias: "State: Preflight Check"
+    icon: mdi:clipboard-check-outline
+    mode: single
+    sequence:
+      # §1.6: each error-set below is gated on a LIVE re-read of the state
+      # (`not states(...).startswith('error_')`), NOT a one-time snapshot taken
+      # at entry. At entry the state is always 'preflight_check', so a snapshot
+      # would always read "not errored" and could let a later check overwrite a
+      # higher-severity error_* that a concurrent handler (e.g. emergency_stop)
+      # latched mid-run. Re-reading matches the A1 guard-the-advance pattern.
+
+      # ---- Check 1: tank (Low-Low for plain) ----
+      - variables:
+          tank_raw: "{{ states('binary_sensor.watering_system_low_low_water_level') }}"
+          tank_available: "{{ tank_raw not in ['unavailable', 'unknown'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not tank_available }}"
+        then:
+          # RACE-FIX: log the breadcrumb BEFORE setting error_*. Setting an
+          # error_ state triggers watering_state_on_error -> abort_cycle_scripts,
+          # which turns off THIS state_* script mid-run; logging first guarantees
+          # the preflight_abort reaches system_log + the watering_system_event bus
+          # (and the Phase 3.5 DB row) before that self-cancel lands.
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: preflight_abort
+              message: >-
+                Preflight abort: Low-Low tank sensor unavailable
+                (state: {{ tank_raw }}) - treating as comms loss (D-G).
+              entity_id: binary_sensor.watering_system_low_low_water_level
+              value_after: "{{ tank_raw }}"
+              logger: watering_system.state_scripts
+          - if:
+              - condition: template
+                value_template: "{{ not states('input_select.watering_system_state').startswith('error_') }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: error_comms_lost
+          - stop: "Tank sensor unavailable - comms lost"
+            error: true
+
+      - if:
+          - condition: state
+            entity_id: binary_sensor.watering_system_low_low_water_level
+            state: "on"
+        then:
+          # RACE-FIX (see Check 1): log before the error-set self-cancels us.
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: preflight_abort
+              message: "Preflight abort: tank at Low-Low - cannot start a watering cycle."
+              entity_id: binary_sensor.watering_system_low_low_water_level
+              value_after: "on"
+              logger: watering_system.state_scripts
+          - if:
+              - condition: template
+                value_template: "{{ not states('input_select.watering_system_state').startswith('error_') }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: error_tank_low
+          - stop: "Tank Low-Low - cannot water"
+            error: true
+
+      # ---- Check 2: ESP32 online (R1 availability proxy) ----
+      - variables:
+          pump_raw: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+          pump_available: "{{ pump_raw not in ['unavailable', 'unknown'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not pump_available }}"
+        then:
+          # RACE-FIX (see Check 1): log before the error-set self-cancels us.
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: preflight_abort
+              message: >-
+                Preflight abort: main pump relay (R1) unavailable
+                (state: {{ pump_raw }}) - ESP32 offline / comms lost.
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ pump_raw }}"
+              logger: watering_system.state_scripts
+          - if:
+              - condition: template
+                value_template: "{{ not states('input_select.watering_system_state').startswith('error_') }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: error_comms_lost
+          - stop: "ESP32 offline - comms lost"
+            error: true
+
+      # ---- Check 3: control booleans (override / winterized) ----
+      # §1.5: this is a PRE-HARDWARE gate - preflight has not started the pump or
+      # opened any valve yet, so returning to idle here does not "silently abort a
+      # running cycle" (nothing is actuated). It therefore does NOT conflict with
+      # the D-F guards' "never abort a running cycle" contract. If a control
+      # boolean is flipped on at this instant, this check and the guard react to
+      # the same edge with no ordering guarantee; either way the conservative
+      # outcome wins (this check returns to idle without watering; the guard
+      # independently reverts the boolean and notifies). Defence in depth over
+      # the scheduler's start-time gate for the window between the two.
+      # §3.2: capture both booleans once; the condition and the log message
+      # below reuse them (nothing between can change them).
+      - variables:
+          override_val: "{{ states('input_boolean.manual_override_active') }}"
+          winterized_val: "{{ states('input_boolean.system_winterized') }}"
+      - if:
+          - condition: template
+            value_template: "{{ override_val == 'on' or winterized_val == 'on' }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: preflight_abort
+              message: >-
+                Preflight abort: manual_override_active or system_winterized is ON
+                (override={{ override_val }}, winterized={{ winterized_val }}).
+                Returning to idle without watering.
+              logger: watering_system.state_scripts
+          - if:
+              - condition: template
+                value_template: "{{ is_state('input_select.watering_system_state', 'preflight_check') }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: idle
+          # §1.14: error: true so the caller distinguishes this halt the same
+          # way as Checks 1 & 2 (the state is already back at idle; the
+          # dispatcher does not branch on the result, so this only affects
+          # trace/log classification).
+          - stop: "Override/winterized active - not watering"
+            error: true
+
+      # ---- All checks passed: mint cycle_uuid, fire Event 1, advance ----
+      - variables:
+          cycle_uuid_new: "{{ 'c-' ~ utcnow().strftime('%Y%m%d%H%M%S%f') }}"
+          start_time: "{{ utcnow().strftime('%Y-%m-%d %H:%M:%S') }}"
+          trigger_type: "{{ states('input_select.active_trigger_type') }}"
+          r24: "{{ states('sensor.brightsky_rain_24h') }}"
+          r72: "{{ states('sensor.brightsky_rain_72h') }}"
+          thy: "{{ states('sensor.brightsky_temp_high_yesterday') }}"
+
+      # A1 guard: only open a cycle if we still own the state.
+      - if:
+          - condition: template
+            value_template: "{{ is_state('input_select.watering_system_state', 'preflight_check') }}"
+        then:
+          - service: input_text.set_value
+            target:
+              entity_id: input_text.cycle_uuid
+            data:
+              value: "{{ cycle_uuid_new }}"
+
+          # Event 1 -> AppDaemon INSERTs watering_cycles + cycle-active on.
+          # Optional numeric fields are sent as '' (=> NULL) when unreadable.
+          - event: watering_preflight_complete
+            event_data:
+              cycle_uuid: "{{ cycle_uuid_new }}"
+              start_time: "{{ start_time }}"
+              trigger_type: "{{ trigger_type }}"
+              rainfall_24h_mm: "{{ r24 | float(0) if is_number(r24) else '' }}"
+              rainfall_72h_mm: "{{ r72 | float(0) if is_number(r72) else '' }}"
+              temp_high_c: "{{ thy | float(0) if is_number(thy) else '' }}"
+
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: watering_plain
+
+  # ==========================================================================
+  # state_watering_plain  -  run the plain watering cycle (Phase 4)
+  # ==========================================================================
+  # Entry: dispatched when watering_system_state -> watering_plain.
+  #
+  # Sequence:
+  #   1. Establish the plain flow path: bypass valve R6 ON, fert line R7 OFF
+  #      (start_main_pump verifies the R6 XOR R7 interlock and aborts to an
+  #      error state if it is wrong).
+  #   2. start_main_pump (tank/relief/interlock checks + 30s stabilisation).
+  #   3. run_zone_sequence(active_watering_window) - per-zone Event 3 fires
+  #      inside run_zone_sequence (ADR-015 D1).
+  #   4. stop_main_pump, then close_all_zones (defensive).
+  #   5. advance to post_cycle_relief.
+  #
+  # NO continue_on_error around start_main_pump / run_zone_sequence /
+  # stop_main_pump: if any sets an error_* state and stops, this script halts
+  # (no advance) and the matching per-error automation runs. A1 guards the
+  # advance as the second line of defence.
+  # ==========================================================================
+  state_watering_plain:
+    alias: "State: Watering (Plain)"
+    icon: mdi:sprinkler-variant
+    mode: single
+    sequence:
+      # 1. Plain flow path: bypass open, fert line closed.
+      - service: switch.turn_on
+        target:
+          entity_id: switch.watering_system_relay_6_fert_bypass
+      - service: switch.turn_off
+        target:
+          entity_id: switch.watering_system_relay_7_fert_line
+      # Allow the bypass (R6) and fert-line (R7) valves to PHYSICALLY open/close
+      # before start_main_pump reads the R6 XOR R7 interlock. Datasheet valve
+      # travel is 6-10s; 12s gives margin over the worst case.
+      - delay:
+          seconds: 12
+
+      # 2. Start the main pump (self-checks; sets error_* + stops on failure).
+      - service: script.start_main_pump
+
+      # 3. Water all due zones for the active window (Event 3 fired within).
+      - service: script.run_zone_sequence
+        data:
+          window: "{{ states('input_select.active_watering_window') }}"
+
+      # 4. Stop pump, then belt-and-braces close all zones.
+      - service: script.stop_main_pump
+      - service: script.close_all_zones
+      # Allow the zone valves to PHYSICALLY close before advancing to
+      # post_cycle_relief (which opens the relief valve). Datasheet valve travel
+      # is 6-10s; 12s gives margin over the worst case.
+      - delay:
+          seconds: 12
+
+      # 5. A1 guard, then advance.
+      - if:
+          - condition: template
+            value_template: "{{ is_state('input_select.watering_system_state', 'watering_plain') }}"
+        then:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: post_cycle_relief
+
+  # ==========================================================================
+  # state_post_cycle_relief  -  relieve pressure, close the cycle (Phase 4)
+  # ==========================================================================
+  # Entry: dispatched when watering_system_state -> post_cycle_relief.
+  #
+  # Built from existing subscripts (ADR-015 D3):
+  #   1. close_all_zones (defensive).
+  #   2. open_pressure_relief - self-contained open -> wait(bounds-checked) ->
+  #      close cycle; it also stops the pump first if somehow still running.
+  #   3. Disable 24V cabinet (R10) - defensive; only RS-485 devices need it, so
+  #      plain watering never enabled it. Mirrors safe_shutdown: turn_off, verify
+  #      with a 3s timeout, warn (do NOT error) if it fails to confirm.
+  #   4. finalize_cycle_record('completed') then -> idle, both under the A1 guard
+  #      so an error that supervened is finalized as 'error' by its own automation
+  #      instead of being mislabelled 'completed' here.
+  #
+  # NO continue_on_error around close_all_zones / open_pressure_relief: a relief
+  # failure sets an error_* state and stops; the per-error automation then runs
+  # safe_shutdown + finalize('error'). The cycle row still closes (invariant).
+  # ==========================================================================
+  state_post_cycle_relief:
+    alias: "State: Post-Cycle Relief"
+    icon: mdi:gauge-low
+    mode: single
+    sequence:
+      # 0. Capture cycle runtime FIRST. binary_sensor.watering_cycle_active has
+      #    been ON since Event 1 (preflight complete = cycle start, db_writer.py),
+      #    so its last_changed marks T0. We read it here, at the very top of
+      #    post_cycle_relief, because finalize_cycle_record (step 4) fires Event 4,
+      #    which AppDaemon turns into cycle_active -> OFF; reading last_changed
+      #    after that would yield ~0 minutes. Resolves to none if the sensor isn't
+      #    ON (e.g. AppDaemon restarted mid-cycle) - send_watering_summary then
+      #    omits the runtime from the message. A script-level variables action, so
+      #    summary_runtime_min stays in scope through the guarded block below.
+      - variables:
+          summary_runtime_min: >-
+            {% set s = states.binary_sensor.watering_cycle_active %}
+            {{ ((now() - s.last_changed).total_seconds() / 60) | round(0) | int
+               if s is not none and s.state == 'on' else none }}
+
+      # 1. Defensive zone close.
+      - service: script.close_all_zones
+
+      # 2. Pressure relief cycle (open -> wait -> close, self-verifying).
+      - service: script.open_pressure_relief
+
+      # 2b. Valve discipline: close BOTH fert-manifold selector valves (R6 bypass
+      # + R7 fert line) so the system rests with every flow path shut - nothing
+      # is left energized that isn't in use. Done AFTER the relief bleed (pressure
+      # is already vented) and BEFORE cutting 24V cabinet power (R10) below, so the
+      # motorized valves still have 24V to travel. watering_plain re-opens R6 at
+      # the start of the next cycle and start_main_pump's R6-XOR-R7 check runs only
+      # after that, so both-closed-at-rest never trips the interlock.
+      - service: switch.turn_off
+        target:
+          entity_id:
+            - switch.watering_system_relay_6_fert_bypass
+            - switch.watering_system_relay_7_fert_line
+
+      # 3. Disable 24V cabinet (R10), verify best-effort (warn only).
+      - service: switch.turn_off
+        target:
+          entity_id: switch.watering_system_relay_10_24v_cabinet
+      - wait_template: "{{ is_state('switch.watering_system_relay_10_24v_cabinet', 'off') }}"
+        timeout: 3
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('switch.watering_system_relay_10_24v_cabinet', 'off') }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: post_cycle_relief
+              message: >-
+                24V cabinet (R10) did not confirm OFF during post-cycle relief
+                (state: {{ states('switch.watering_system_relay_10_24v_cabinet') }}).
+              entity_id: switch.watering_system_relay_10_24v_cabinet
+              value_after: "{{ states('switch.watering_system_relay_10_24v_cabinet') }}"
+              logger: watering_system.state_scripts
+
+      # 4. A1 guard: close the DB row 'completed' and return to idle only if we
+      #    still own the state (else the supervening error's automation finalizes).
+      - if:
+          - condition: template
+            value_template: "{{ is_state('input_select.watering_system_state', 'post_cycle_relief') }}"
+        then:
+          # continue_on_error so a DB/finalize hiccup can never strand the machine
+          # in post_cycle_relief: the idle transition below MUST still run. This
+          # matches watering_state_on_error and watering_state_restart_recovery,
+          # which also wrap finalize in continue_on_error. finalize is report-only
+          # (D3: no hardware, no state), so ignoring its failure here is safe; the
+          # restart-recovery backstop still closes any row finalize missed.
+          - service: script.finalize_cycle_record
+            continue_on_error: true
+            data:
+              outcome: completed
+              notes: "post-cycle relief complete"
+          # 9.10: end-of-cycle Watering Summary (STANDARD tier - WhatsApp-only,
+          # winter-gated inside send_standard_notification). continue_on_error so
+          # a notify hiccup can NEVER strand the machine in post_cycle_relief: the
+          # idle transition below MUST still run (same rationale as finalize
+          # above). Placed AFTER finalize so it reflects the closed cycle; runtime
+          # was captured at step 0, before Event 4 flipped cycle_active OFF.
+          - service: script.send_watering_summary
+            continue_on_error: true
+            data:
+              runtime_min: "{{ summary_runtime_min }}"
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: idle

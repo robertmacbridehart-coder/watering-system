@@ -1,0 +1,352 @@
+################################################################################
+# Notification System - Tiered Notification Scripts
+# Purpose: Central communication scripts for all system notifications
+# Location: home-assistant/packages/notification/scripts.yaml
+################################################################################
+
+script:
+  ############################################################################
+  # CRITICAL Tier - WhatsApp + Email (Simultaneous)
+  # Use for: Emergency stops, tank failures, system errors, test failures
+  ############################################################################
+
+  send_critical_notification:
+    alias: "Send CRITICAL Notification"
+    description: "Send critical alert via WhatsApp and Email"
+    icon: mdi:alert-octagon
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Critical event message"
+        example: "Tank Low-Low emergency stop"
+        required: true
+      bypass_winterization:
+        description: >-
+          If true, send even while system_winterized is on. Use ONLY for
+          safety-relevant alerts that must reach the operator during the
+          off-season. Defaults to false (normal winter suppression).
+        example: "false"
+        required: false
+    sequence:
+      # Suppress notifications while winterized - UNLESS the caller sets
+      # bypass_winterization (a safety alert that must land off-season, §1.3).
+      # Single OR-condition so a failing gate stops the script exactly as the
+      # original bare condition did. §2.6: defined once here as the &winter_gate
+      # anchor and reused via *winter_gate in send_high_notification below, so
+      # the winter-bypass rule lives in exactly one place (no silent drift).
+      - &winter_gate
+        condition: template
+        value_template: >-
+          {{ (bypass_winterization | default(false) | bool)
+             or is_state('input_boolean.system_winterized', 'off') }}
+
+      # Format message with timestamp and emoji
+      - variables:
+          timestamp: "{{now().strftime('%Y-%m-%d %H:%M:%S')}}"
+          formatted_message: >
+            🚨 CRITICAL: {{message}}
+            Time: {{timestamp}}
+            Action Required: Check system immediately
+      # Send via WhatsApp
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{formatted_message}}"
+        continue_on_error: true
+
+      # Send via Email
+      - service: notify.gmail_smtp
+        data:
+          title: "🚨 CRITICAL: Watering System Alert"
+          message: "{{formatted_message}}"
+        continue_on_error: true
+
+  ############################################################################
+  # HIGH Tier - WhatsApp + Email (Simultaneous)
+  # Use for: Warnings, degraded states, runtime limits, preflight failures
+  ############################################################################
+
+  send_high_notification:
+    alias: "Send HIGH Notification"
+    description: "Send high-priority warning via WhatsApp and Email"
+    icon: mdi:alert
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Warning message"
+        example: "Zone runtime exceeded safety limit"
+        required: true
+      bypass_winterization:
+        description: >-
+          If true, send even while system_winterized is on. Use ONLY for
+          safety-relevant warnings that must reach the operator during the
+          off-season (e.g. a control state engaged from an error). Defaults to
+          false (normal winter suppression).
+        example: "false"
+        required: false
+    sequence:
+      # §2.6: the same winter-gate as send_critical_notification, reused via the
+      # *winter_gate YAML anchor so both tiers share one definition. A failing
+      # gate stops the script exactly as the original bare condition did.
+      - *winter_gate
+
+      # Format message with timestamp and emoji
+      - variables:
+          timestamp: "{{now().strftime('%Y-%m-%d %H:%M:%S')}}"
+          formatted_message: >
+            ⚠️ WARNING: {{message}}
+            Time: {{timestamp}}
+            System Status: Check dashboard for details
+
+      # Send via WhatsApp
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{formatted_message}}"
+        continue_on_error: true
+
+      # Send via Email
+      - service: notify.gmail_smtp
+        data:
+          title: "⚠️ WARNING: Watering System"
+          message: "{{formatted_message}}"
+        continue_on_error: true
+
+  ############################################################################
+  # STANDARD Tier - WhatsApp Only
+  # Use for: Watering summaries, informational updates, routine notifications
+  ############################################################################
+
+  send_standard_notification:
+    alias: "Send STANDARD Notification"
+    description: "Send standard informational message via WhatsApp only"
+    icon: mdi:message-text
+    mode: queued
+    max: 5
+    fields:
+      message:
+        description: "Informational message"
+        example: "Watering cycle complete - 3 zones watered"
+        required: true
+    sequence:
+      # Check winterization status
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+
+      # Format message with timestamp and emoji. LITERAL block (|-) not folded
+      # (>): a folded scalar collapses the newline before "Time:" into a space
+      # AND flattens any multi-line {{message}} into one wall of text (unreadable
+      # on a phone - e.g. the watering summary's per-zone lines). Literal keeps
+      # the caller's line breaks and puts the timestamp on its own line.
+      - variables:
+          timestamp: "{{now().strftime('%Y-%m-%d %H:%M:%S')}}"
+          formatted_message: |-
+            ✅ {{ message }}
+            🕐 {{ timestamp }}
+
+      # Send via WhatsApp only (standard tier)
+      - service: rest_command.send_whatsapp_notification
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: "{{formatted_message}}"
+        continue_on_error: true
+
+  ############################################################################
+  # WATERING SUMMARY - compiles end-of-cycle data, calls STANDARD tier
+  # Use for: the end-of-cycle notification fired by state_post_cycle_relief
+  #          (Phase 9.10). WhatsApp-only + winter-gated via the standard tier.
+  ############################################################################
+  #
+  # Compiled from HA state, NOT a DB query. This script only runs at the clean
+  # end of a completed cycle (state_post_cycle_relief is reached only when >=1
+  # zone actually watered - window_check diverts an all-'off' evaluation straight
+  # to idle - and any error latches an error_* state that never reaches here), so
+  # HA state is authoritative for the compact one-liner:
+  #   - zones + programs : input_select.zone_N_program (!= 'off') named via
+  #                        input_text.zone_N_friendly_name
+  #   - window / trigger : input_select.active_watering_window / _trigger_type
+  #   - runtime          : passed in by the caller (runtime_min), captured from
+  #                        binary_sensor.watering_cycle_active.last_changed BEFORE
+  #                        finalize_cycle_record fires Event 4 (which flips that
+  #                        sensor OFF). Omitted from the line if not a number.
+  # Fertilizer is intentionally not reported: the fert path is unwired (Phase
+  # 3.3, hardware-blocked), so a plain-watering cycle never doses. When the fert
+  # path lands, a dose summary can be added here (or sourced from the DB
+  # zone_runs/fertigation_doses rows - see impl_roadmap.md Section 9.10 note).
+  ############################################################################
+  send_watering_summary:
+    alias: "Send Watering Summary"
+    description: "Compile end-of-cycle data into a compact STANDARD notification"
+    icon: mdi:water-check
+    mode: single
+    fields:
+      runtime_min:
+        description: >-
+          Whole-minute cycle runtime, captured by the caller before Event 4.
+          Anything non-numeric (or omitted) drops the runtime from the message.
+        example: "45"
+        required: false
+    sequence:
+      - variables:
+          # One "• Friendly Name (program)" bullet per zone that watered this
+          # cycle (program light/normal/heavy/booster; 'off' zones skipped). Returned as a
+          # native LIST (like state_window_check's `programs`): HA parses the
+          # rendered list literal back to a real list, immune to this multi-line
+          # template's folded whitespace. The newline join happens in the single-
+          # line summary_message expression below, where '\n' is a Jinja string
+          # literal (a real newline) - NOT written as source line breaks, which a
+          # folded (>-) scalar would collapse to spaces.
+          zone_lines: >-
+            {% set ns = namespace(items=[]) %}
+            {% for z in [1, 2, 3, 4] %}
+              {% set prog = states('input_select.zone_' ~ z ~ '_program') %}
+              {# 'booster' = the heavy mid-interval 0.5× top-up (ADR-020); include it
+                 so a booster-only evening isn't reported as "complete, no zones". #}
+              {% if prog in ['light', 'normal', 'heavy', 'booster'] %}
+                {% set nm = states('input_text.zone_' ~ z ~ '_friendly_name') %}
+                {% set plabel = 'booster (0.5×)' if prog == 'booster' else prog %}
+                {% set ns.items = ns.items + ['• ' ~ nm ~ ' (' ~ plabel ~ ')'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.items }}
+          window_raw: "{{ states('input_select.active_watering_window') }}"
+          # "Morning watering complete" / "Evening watering complete"; a generic
+          # fallback if the window helper is somehow unreadable.
+          headline: >-
+            {{ (window_raw | capitalize ~ ' watering complete')
+               if window_raw in ['morning', 'evening']
+               else 'Watering cycle complete' }}
+          manual_tag: >-
+            {{ ' (manual)'
+               if states('input_select.active_trigger_type') == 'manual'
+               else '' }}
+          # Mobile-friendly multi-line body: headline, one zone per line, then a
+          # runtime line (omitted entirely if runtime_min is not a number). Built
+          # in ONE {{ }} expression so all newlines come from Jinja '\n' literals
+          # (survive the folded scalar); send_standard_notification adds the ✅
+          # prefix + the timestamp line.
+          summary_message: >-
+            {{ headline ~ manual_tag ~ '\n'
+               ~ (zone_lines | join('\n') if zone_lines | length > 0
+                  else '• no zones watered')
+               ~ ('\nRuntime: ' ~ (runtime_min | int) ~ ' min'
+                  if is_number(runtime_min | default(none)) else '') }}
+
+      # Hand off to the STANDARD tier (WhatsApp-only + winter gate). It prepends
+      # the check-mark and appends the timestamp line.
+      - service: script.send_standard_notification
+        data:
+          message: "{{ summary_message }}"
+
+  ############################################################################
+  # DIAGNOSTIC - WhatsApp path check (manual, Dev-Tools trigger only)
+  # Purpose: exercise the CallMeBot leg directly and SURFACE the HTTP result,
+  #          which the production tier scripts swallow (continue_on_error on the
+  #          rest_command). Use to diagnose "WhatsApp stopped arriving".
+  # Trigger: Developer Tools -> Actions -> script.diagnose_whatsapp_path (Run).
+  #          Wired to nothing - touches no production path.
+  # Read the result two ways:
+  #   - a persistent notification in the HA UI (immediate, human-readable)
+  #   - script.log_system_event (system_log + watering_ops system_events row)
+  # NOTE: this deliberately BYPASSES the winterization gate - it tests the
+  #   transport, not the gated production path. If the summary / monthly test are
+  #   silent, also check input_boolean.system_winterized separately.
+  # Interpreting CallMeBot: HTTP 200 = delivered; a 2xx whose BODY says something
+  #   like "APIKey not valid" / "phone not registered" = the free-tier key
+  #   deactivated (re-request it by messaging the CallMeBot number); no status
+  #   captured = a transport error (network/DNS/TLS) - see the script trace.
+  ############################################################################
+  diagnose_whatsapp_path:
+    alias: "Diagnostic: WhatsApp Path Check"
+    description: "Manually test the CallMeBot WhatsApp leg and surface the result"
+    icon: mdi:message-alert-outline
+    mode: single
+    sequence:
+      - variables:
+          test_stamp: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+
+      # Call the SAME rest_command the production scripts use, but CAPTURE the
+      # response instead of swallowing it. continue_on_error so a transport-level
+      # failure still reaches the reporting steps below (whatsapp_response then
+      # stays undefined, which the next block detects).
+      - service: rest_command.send_whatsapp_notification
+        continue_on_error: true
+        response_variable: whatsapp_response
+        data:
+          phone: !secret whatsapp_phone
+          apikey: !secret whatsapp_api_key
+          text: >-
+            🔧 WhatsApp path diagnostic — {{ test_stamp }}. If you can read this,
+            the CallMeBot leg is delivering.
+
+      - variables:
+          got_response: "{{ whatsapp_response is defined }}"
+          http_status: >-
+            {{ whatsapp_response.status if got_response
+               else 'none (transport error)' }}
+          # CallMeBot returns a short text/HTML body; cap it so a huge page can't
+          # bloat the notification / DB note.
+          http_body: >-
+            {{ (whatsapp_response.content | string)[:300] if got_response
+               else 'No response captured - connection/DNS/TLS error. See the script trace.' }}
+          result_line: >-
+            WhatsApp diagnostic {{ test_stamp }} - status={{ http_status }}
+
+      # 1) Immediate, human-readable result in the HA UI. Literal block (|) so the
+      #    line breaks survive (persistent_notification renders markdown).
+      - service: persistent_notification.create
+        data:
+          notification_id: whatsapp_path_diagnostic
+          title: "WhatsApp Path Diagnostic"
+          message: |
+            {{ result_line }}
+
+            Body (first 300 chars):
+            {{ http_body }}
+
+            HTTP 200 = delivered. A 2xx with an error body (e.g. "APIKey not
+            valid") means the CallMeBot key needs re-activating. No status =
+            transport error.
+
+      # 2) Durable breadcrumb (system_log + system_events DB).
+      - service: script.log_system_event
+        data:
+          severity: "{{ 'info' if http_status == 200 else 'warning' }}"
+          event_type: whatsapp_diagnostic
+          message: "{{ result_line }} | body={{ http_body }}"
+          value_after: "{{ http_status }}"
+          logger: watering_system.notification
+
+################################################################################
+# Usage Examples (for future integration)
+################################################################################
+
+# Example 1: Safety automation calls critical notification
+# - service: script.send_critical_notification
+#   data:
+#     message: "Tank Low-Low level reached. System stopped."
+
+# Example 2: Zone runtime safety calls high notification
+# - service: script.send_high_notification
+#   data:
+#     message: "Zone 1 exceeded max runtime and was stopped."
+
+# Example 3: State machine calls standard notification
+# - service: script.send_standard_notification
+#   data:
+#     message: |
+#       Watering Summary - Morning Window
+#       Zones: 1 (normal), 2 (light), 4 (heavy)
+#       Fertilizer: Zone 3 - Pump 1: 60ml
+#       Errors: None
+#       Runtime: 45min
+#       Zones: 1 (normal), 2 (light), 4 (heavy)
+#       Fertilizer: Zone 3 - Pump 1: 60ml
+#       Errors: None
+#       Runtime: 45min

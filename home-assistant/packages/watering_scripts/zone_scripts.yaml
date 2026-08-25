@@ -1,0 +1,797 @@
+# ============================================================================
+# Zone Control Scripts - Phase 3.1
+# ============================================================================
+# Purpose: Core zone control operations called by state machine
+# Location: home-assistant/packages/watering_scripts/zone_scripts.yaml
+#
+# Scripts:
+#   1. open_zone - Safely open a single zone valve
+#   2. close_zone - Close a single zone valve
+#   3. close_all_zones - Emergency cleanup - close all zone valves
+#   4. calculate_zone_runtime - Calculate runtime based on program and window
+#   4b. fire_zone_run_complete - Fire Event 3 for one closed zone (reporting only)
+#   4d. water_one_zone - Run one zone: open -> hold -> close -> Event 3
+#   5. run_zone_sequence - Execute watering for all active zones
+#
+# Phase 4 note (2026-08-09, ADR-015 D1): run_zone_sequence gained REPORTING-ONLY
+# instrumentation - each zone that runs mints a local, parallel-safe per-zone
+# zrun_uuid ('z-<utc-us>-<zone_id>'), captures start/end, and fires Event 3
+# (watering_zone_run_complete, architecture.md 13.3.1) at the zone's close. The
+# watering control logic is unchanged; the additions only emit telemetry and
+# cannot alter valve/pump behaviour. An aborted zone (killed mid-delay by
+# script.abort_cycle_scripts) never reaches its Event 3 - only the CYCLE row is
+# guaranteed to close (via finalize_cycle_record). The per-zone open/hold/close/
+# Event-3 body was later extracted into water_one_zone (single source for all 8
+# call sites); it is in abort_cycle_scripts' turn_off set so the abort invariant
+# above still holds.
+#
+# Safety Features:
+#   - Pump verification before opening valves (prevent dry-run)
+#   - Valve interlock verification (R6 XOR R7)
+#   - ESPHome 120min auto-off provides backstop
+#   - Error state setting for invalid configurations
+#   - Unavailable entity detection
+#   - Input validation and type casting
+#   - Persistent event logging via script.log_system_event (system_log +
+#     watering_ops.system_events; see logging_scripts.yaml)
+#   - Absolute runtime caps (120min max)
+#   - Parameter validation with error logging
+#
+# Error States:
+#   - error_relay_state: Pump issues (off/unavailable)
+#   - error_valve_interlock: Invalid R6/R7 configuration
+#
+# ============================================================================
+
+script:
+  # ==========================================================================
+  # Script 1: Open Zone
+  # ==========================================================================
+  # Opens a single zone valve after verifying safety conditions
+  # Called by: run_zone_sequence, state machine
+  #
+  # Parameters:
+  #   zone_id (required): Which zone to open (1-4) - accepts int or string
+  #
+  # Safety Checks:
+  #   1. Verify zone_id is valid (1-4) after casting to int
+  #   2. Verify main pump is running (not off, not unavailable)
+  #   3. Verify valid flow path (R6 XOR R7 - exactly one on)
+  #   4. Verify valve states are not unavailable
+  #
+  # Error Handling:
+  #   - Invalid zone_id: Silent abort (condition fails)
+  #   - Pump not running/unavailable: Set error_relay_state, log, stop with error
+  #   - Invalid valve configuration: Set error_valve_interlock, log, stop with error
+  #   - Valve states unavailable: Set error_valve_interlock, log, stop with error
+  #
+  # Logging: script.log_system_event writes system_log + a persistent
+  # system_events row (see logging_scripts.yaml)
+  # ==========================================================================
+
+  open_zone:
+    alias: "Open Zone"
+    mode: single
+    icon: mdi:valve-open
+    fields:
+      zone_id:
+        description: "Zone to open (1-4)"
+        example: 1
+        required: true
+    sequence:
+      # Cast zone_id to integer and validate range
+      - variables:
+          zone_id_int: "{{ zone_id | int }}"
+
+      # Verify zone_id is valid (1-4)
+      - condition: template
+        value_template: "{{ zone_id_int in [1, 2, 3, 4] }}"
+
+      # Check if main pump is running (not off, not unavailable)
+      - variables:
+          pump_state: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ pump_state != 'on' }}"
+        then:
+          # Set error state for pump issues
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: error_relay_state
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: zone_open_abort
+              message: "Cannot open zone {{ zone_id_int }}: main pump not running (state: {{ pump_state }})"
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ pump_state }}"
+              logger: watering_system.zone_scripts
+
+          - stop: "Pump not running - cannot open zone"
+            error: true
+
+      # Check valid flow path (R6 XOR R7 - exactly one on)
+      # Also verify valves are not in unavailable state
+      - variables:
+          r6_state: "{{ states('switch.watering_system_relay_6_fert_bypass') }}"
+          r7_state: "{{ states('switch.watering_system_relay_7_fert_line') }}"
+          valves_available: "{{ r6_state not in ['unavailable', 'unknown'] and r7_state not in ['unavailable', 'unknown'] }}"
+          valid_path: "{{ (r6_state == 'on' and r7_state != 'on') or (r6_state != 'on' and r7_state == 'on') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not valves_available or not valid_path }}"
+        then:
+          # Invalid valve configuration or unavailable - set error state
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: error_valve_interlock
+
+          - variables:
+              error_msg: "{{ 'Cannot open zone %d: valve states unavailable (R6=%s, R7=%s)' | format(zone_id_int, r6_state, r7_state) if not valves_available else 'Cannot open zone %d: invalid valve configuration (R6=%s, R7=%s)' | format(zone_id_int, r6_state, r7_state) }}"
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: zone_open_abort
+              message: "{{ error_msg }}"
+              logger: watering_system.zone_scripts
+
+          - stop: "Invalid valve configuration - cannot open zone"
+            error: true
+
+      # All checks passed - open the zone valve
+      # zone_id 1 → relay_2_zone_1
+      # zone_id 2 → relay_3_zone_2
+      # zone_id 3 → relay_4_zone_3
+      # zone_id 4 → relay_5_zone_4
+      - service: switch.turn_on
+        target:
+          entity_id: "switch.watering_system_relay_{{ zone_id_int + 1 }}_zone_{{ zone_id_int }}"
+
+  # ==========================================================================
+  # Script 2: Close Zone
+  # ==========================================================================
+  # Closes a single zone valve
+  # Called by: run_zone_sequence, state machine, emergency procedures
+  #
+  # Parameters:
+  #   zone_id (required): Which zone to close (1-4) - accepts int or string
+  # ==========================================================================
+
+  close_zone:
+    alias: "Close Zone"
+    mode: single
+    icon: mdi:valve-closed
+    fields:
+      zone_id:
+        description: "Zone to close (1-4)"
+        example: 1
+        required: true
+    sequence:
+      # Cast zone_id to integer and validate range
+      - variables:
+          zone_id_int: "{{ zone_id | int }}"
+
+      # Verify zone_id is valid (1-4)
+      - condition: template
+        value_template: "{{ zone_id_int in [1, 2, 3, 4] }}"
+
+      # Close the zone valve
+      - service: switch.turn_off
+        target:
+          entity_id: "switch.watering_system_relay_{{ zone_id_int + 1 }}_zone_{{ zone_id_int }}"
+
+  # ==========================================================================
+  # Script 3: Close All Zones
+  # ==========================================================================
+  # Emergency cleanup - closes all zone valves simultaneously
+  # Called by: run_zone_sequence (cleanup), emergency_stop, safety automations
+  #
+  # No parameters required
+  # ==========================================================================
+
+  close_all_zones:
+    alias: "Close All Zones"
+    mode: single
+    icon: mdi:valve-closed
+    sequence:
+      # Turn off all four zone relays simultaneously
+      - service: switch.turn_off
+        target:
+          entity_id:
+            - switch.watering_system_relay_2_zone_1
+            - switch.watering_system_relay_3_zone_2
+            - switch.watering_system_relay_4_zone_3
+            - switch.watering_system_relay_5_zone_4
+
+  # ==========================================================================
+  # Script 4: Calculate Zone Runtime
+  # ==========================================================================
+  # Pure function: calculates runtime for a zone based on current program
+  # and window context
+  #
+  # Called by: run_zone_sequence, fert scripts
+  #
+  # Parameters:
+  #   zone_id (required): Which zone to calculate for (1-4) - accepts int or string
+  #   window (required): Which watering window ('morning' or 'evening')
+  #
+  # Returns:
+  #   runtime_minutes (float): Calculated runtime in minutes
+  #
+  # Program -> multiplier (window-INDEPENDENT since the Phase 7 cadence rework;
+  # the same-day heavy split was RETIRED in favour of a mid-interval booster):
+  #   - off     -> 0.0
+  #   - light   -> base_runtime × 0.5
+  #   - normal  -> base_runtime × 1.0
+  #   - heavy   -> base_runtime × 1.0   (MAIN dose; the extra 0.5x is delivered
+  #                separately as a 'booster' run at the interval midpoint, placed
+  #                by state_window_check)
+  #   - booster -> base_runtime × 0.5   (the heavy mid-interval top-up)
+  #
+  # HEAVY EXCEPTION (N==1 single-window): when only one window is enabled AND the
+  # zone's interval is daily (input_number.zone_N_watering_interval_days == 1),
+  # the booster slot collides with the main slot, so 'heavy' delivers the full
+  # 1.5x as a single dose here (window_check schedules no separate booster then).
+  #
+  # COUPLING NOTE (ADR-020 review Fix #3, accepted): the N==1 heavy=1.5x edge is
+  # decided in TWO places from the SAME inputs - state_window_check chooses the
+  # 'heavy' program, and this script independently re-reads the enable-window
+  # booleans + interval to apply the 1.5x. They agree as long as those helpers do
+  # not change between window_check and run_zone_sequence. The window booleans are
+  # RestoreEntity and effectively never toggle mid-cycle, so this is a latent
+  # robustness coupling, not a live bug; a future refactor could have
+  # state_window_check resolve the intent once and pass it forward. Left as-is for
+  # now (documented, not refactored pre-go-live).
+  #
+  # `window` is retained in the signature for call-site compatibility but no
+  # longer affects the multiplier (heavy no longer splits across windows).
+  #
+  # Error Handling:
+  #   - Invalid zone_id/window: Silent abort (condition fails)
+  #   - Unavailable configuration: Stop with error
+  # ==========================================================================
+
+  calculate_zone_runtime:
+    alias: "Calculate Zone Runtime"
+    mode: parallel
+    max: 10
+    icon: mdi:calculator
+    fields:
+      zone_id:
+        description: "Zone to calculate for (1-4)"
+        example: 1
+        required: true
+      window:
+        description: "Watering window (morning or evening)"
+        example: "morning"
+        required: true
+    sequence:
+      # Cast zone_id to integer
+      - variables:
+          zone_id_int: "{{ zone_id | int }}"
+
+      # Verify parameters are valid
+      - condition: template
+        value_template: "{{ zone_id_int in [1, 2, 3, 4] and window in ['morning', 'evening'] }}"
+
+      # Gather configuration values
+      - variables:
+          base_runtime: "{{ states('input_number.zone_' ~ zone_id_int ~ '_base_runtime_min') | float(default=-1) }}"
+          program: "{{ states('input_select.zone_' ~ zone_id_int ~ '_program') }}"
+          morning_enabled: "{{ is_state('input_boolean.enable_morning_window', 'on') }}"
+          evening_enabled: "{{ is_state('input_boolean.enable_evening_window', 'on') }}"
+          interval_days: "{{ states('input_number.zone_' ~ zone_id_int ~ '_watering_interval_days') | int(3) }}"
+
+      # Validate configuration is available
+      - if:
+          - condition: template
+            value_template: "{{ base_runtime < 0 or program in ['unavailable', 'unknown', ''] }}"
+        then:
+          - stop: "Zone {{ zone_id_int }} configuration unavailable (base_runtime={{ base_runtime }}, program={{ program }})"
+            error: true
+
+      # Resolve the program→multiplier ONCE here so this script is the SINGLE
+      # source of truth for it (ADR-020 review §3/§5). runtime_minutes is derived
+      # from `mult`, and `mult` is returned in the result so run_zone_sequence can
+      # thread the EXACT value onto Event 3 (fire_zone_run_complete) rather than
+      # re-deriving it from a static map that cannot see the N==1 heavy edge.
+      - variables:
+          single_window: >-
+            {{ (morning_enabled and not evening_enabled)
+               or (evening_enabled and not morning_enabled) }}
+          mult: >-
+            {% if program == 'off' %}
+              {{ 0.0 }}
+            {% elif program == 'light' %}
+              {{ 0.5 }}
+            {% elif program == 'normal' %}
+              {{ 1.0 }}
+            {% elif program == 'booster' %}
+              {# Heavy mid-interval top-up: always 0.5x, window-independent. #}
+              {{ 0.5 }}
+            {% elif program == 'heavy' %}
+              {# MAIN heavy dose = 1.0x; the extra 0.5x rides a separate 'booster'
+                 run at the interval midpoint. EXCEPTION: N==1 single-window
+                 collides main+booster -> full 1.5x single dose here. #}
+              {% if single_window and interval_days == 1 %}
+                {{ 1.5 }}
+              {% else %}
+                {{ 1.0 }}
+              {% endif %}
+            {% else %}
+              {# Unknown program - default to 0 #}
+              {{ 0.0 }}
+            {% endif %}
+
+      # §3.4: return program + multiplier + runtime so run_zone_sequence can stamp
+      # all three onto Event 3 without re-reading input_select / re-deriving mult.
+      - variables:
+          result:
+            program: "{{ program }}"
+            multiplier: "{{ mult | float }}"
+            runtime_minutes: "{{ base_runtime * (mult | float) }}"
+
+      # Return the calculated runtime
+      - stop: "Runtime calculated for zone {{ zone_id_int }}"
+        response_variable: result
+
+  # ==========================================================================
+  # Script 4b: Fire Zone-Run-Complete (Event 3)  -  reporting only
+  # ==========================================================================
+  # Single home for the watering_zone_run_complete (Event 3) payload, called
+  # once per zone after it closes. Previously this ~10-line event block was
+  # hand-copied 8 times (4 zones x parallel/sequential); centralising it removes
+  # that duplication (§2.7), the 9x-duplicated uuid mint (§2.8), and makes the
+  # 'aborted' flag a real parameter instead of a hardcoded 0 (§1.16 - a future
+  # safe-stop path can now report aborted zones by passing aborted: 1).
+  #
+  # zrun_uuid is CYCLE-SCOPED (§4.1): '<cycle_uuid>-z<zone_id>'. Because
+  # cycle_uuid is unique per cycle and zone_id per zone, two different cycles'
+  # zone runs can never collide even if their opens fall in the same
+  # microsecond. When called OUTSIDE a cycle (empty cycle_uuid - the manual
+  # Dev-Tools test path that calls run_zone_sequence directly, §1.11) it falls
+  # back to a standalone 'z-<ts>-<zone_id>' id, and the emitted Event 3 carries
+  # an empty cycle_uuid; the (future) AppDaemon consumer treats that as an
+  # uncorrelated test run and writes no zone_runs row - expected for a run with
+  # no parent cycle, NOT a silent failure.
+  #
+  # HARD BOUNDARY: reporting only. It fires an event and touches no hardware or
+  # state, so it is deliberately NOT in abort_cycle_scripts' turn_off list.
+  #
+  # mode: parallel (max 4) - in parallel watering mode all four zones can call
+  # this within the same instant as they close.
+  # ==========================================================================
+  fire_zone_run_complete:
+    alias: "Fire Zone Run Complete (Event 3)"
+    icon: mdi:map-marker-check
+    mode: parallel
+    max: 4
+    fields:
+      zone_id:
+        description: "Zone that just closed (1-4)"
+        example: 1
+        required: true
+      weather_program:
+        description: "Resolved program for the run (off/light/normal/heavy/booster); 'booster' is recorded as heavy+0.5 multiplier"
+        example: "normal"
+        required: true
+      program_multiplier:
+        description: "Actual runtime multiplier from calculate_zone_runtime (single source): 1.0 heavy main, 0.5 booster, 1.5 N==1 single-window heavy"
+        example: 1.0
+        required: true
+      start_time:
+        description: "UTC 'YYYY-MM-DD HH:MM:SS' captured just before the zone opened"
+        example: "2026-08-12 05:00:00"
+        required: true
+      planned_duration_sec:
+        description: "Planned run duration in seconds (runtime_minutes * 60)"
+        example: 900
+        required: true
+      cycle_uuid:
+        description: "Cycle correlation id captured once by the caller (may be empty)"
+        example: "c-20260812050000000000"
+        required: true
+      aborted:
+        description: "1 if the run was cut short, else 0 (default 0)"
+        example: 0
+        required: false
+    sequence:
+      - variables:
+          # A cycle is open iff cycle_uuid carries a real minted id. Instead of a
+          # multi-value "no cycle" sentinel list (which had to be kept in sync with
+          # a twin in finalize_cycle_record), test the documented 'c-' uuid-format
+          # invariant (config_helpers.yaml: cycle ids are 'c-' + UTC microsecond
+          # timestamp). '', 'unknown', 'unavailable' and any non-'c-' value are
+          # therefore "no cycle". | string guards the required field defensively.
+          cycle_open: >-
+            {{ (cycle_uuid | string).startswith('c-') }}
+          # §2.7: the no-cycle fallback shares its '%Y%m%d%H%M%S%f' timestamp
+          # format with cycle_uuid_new in state_preflight_check (state_scripts.yaml).
+          # Only these two mints remain; keep the format in sync if it changes
+          # (e.g. added entropy against same-microsecond collisions).
+          zrun_uuid: >-
+            {{ (cycle_uuid ~ '-z' ~ zone_id) if cycle_open
+               else ('z-' ~ utcnow().strftime('%Y%m%d%H%M%S%f') ~ '-' ~ zone_id) }}
+          # Phase 7 (Option 1) DB boundary: the mid-interval 'booster' is a heavy
+          # top-up recorded as weather_program='heavy' with program_multiplier=0.5,
+          # so the zone_runs CHECK vocabulary (off/light/normal/heavy) and
+          # db_writer.WEATHER_PROGRAMS are unchanged. sensor.zone_N_watering
+          # excludes (heavy, 0.5) so the interval anchor tracks MAIN doses only.
+          db_program: "{{ 'heavy' if weather_program == 'booster' else weather_program }}"
+          # program_multiplier is now THREADED from calculate_zone_runtime (via
+          # run_zone_sequence -> water_one_zone), not re-derived here. This is the
+          # only way to record the N==1 single-window heavy = 1.5× edge correctly;
+          # a static map here (former 3rd copy, ADR-020 review §3/§5) could not.
+      # Event 3 - zone run closed (architecture.md 13.3.1).
+      - event: watering_zone_run_complete
+        event_data:
+          cycle_uuid: "{{ cycle_uuid }}"
+          zrun_uuid: "{{ zrun_uuid }}"
+          zone_id: "{{ zone_id | int }}"
+          weather_program: "{{ db_program }}"
+          # | float(1.0) is the single authoritative guard at the WRITE boundary:
+          # HA `required:` is advisory, and this Event-3 emit is called via
+          # continue_on_error (water_one_zone), so a missing/non-numeric value must
+          # NOT write NULL (which the anchor filter reads as a MAIN dose) nor error
+          # out (which would drop the row entirely). Any upstream omission from any
+          # of the 8 call sites resolves here to a safe 1.0 (main). Trade-off: this
+          # masks an omission AS a main dose rather than failing loudly - the lower
+          # risk given the alternatives above (ADR-020 review Fix #2).
+          program_multiplier: "{{ program_multiplier | float(1.0) }}"
+          start_time: "{{ start_time }}"
+          end_time: "{{ utcnow().strftime('%Y-%m-%d %H:%M:%S') }}"
+          planned_duration_sec: "{{ planned_duration_sec | int }}"
+          aborted: "{{ aborted | default(0) | int }}"
+
+  # ==========================================================================
+  # Script 4d: Water One Zone  -  open -> hold -> close -> Event 3 (single zone)
+  # ==========================================================================
+  # Single home for one zone's run: capture start, open the valve, hold for the
+  # (already capped) runtime, close, then fire Event 3 via fire_zone_run_complete.
+  # This body used to be hand-inlined 8 times in run_zone_sequence (4 zones x
+  # parallel/sequential); centralising it removes that duplication.
+  #
+  # runtime_minutes <= 0 is a no-op (zone not due this window), so parallel mode
+  # can call it unconditionally; sequential mode still guards on runtime to decide
+  # whether to add the 30s inter-zone delay.
+  #
+  # ABORT DEPENDENCY (safety-critical): the per-zone hold is a `delay` INSIDE this
+  # script. Exactly like run_zone_sequence before the extraction, this script MUST
+  # be in abort_cycle_scripts' turn_off set - otherwise an aborted cycle would let
+  # the delay run to completion, close the zone, and fire a spurious 'completed'
+  # Event 3 (breaking "an aborted zone never reaches its Event 3"). It is added
+  # there explicitly (state_scripts.yaml, abort_cycle_scripts).
+  #
+  # mode: parallel (max 4) - parallel watering runs all four zones at once.
+  # ==========================================================================
+  water_one_zone:
+    alias: "Water One Zone"
+    icon: mdi:sprinkler
+    mode: parallel
+    max: 4
+    fields:
+      zone_id:
+        description: "Zone to water (1-4)"
+        example: 1
+        required: true
+      runtime_minutes:
+        description: "Capped run duration in minutes; <= 0 means skip (no-op)"
+        example: 15
+        required: true
+      weather_program:
+        description: "Resolved program for the run (off/light/normal/heavy/booster)"
+        example: "normal"
+        required: true
+      program_multiplier:
+        description: "Actual runtime multiplier from calculate_zone_runtime; forwarded verbatim to Event 3"
+        example: 1.0
+        required: true
+      cycle_uuid:
+        description: "Cycle correlation id captured once by the caller (may be empty)"
+        example: "c-20260812050000000000"
+        required: true
+    sequence:
+      - if:
+          - condition: template
+            value_template: "{{ runtime_minutes | float(0) > 0 }}"
+        then:
+          # Capture start just before the zone opens; Event 3 fired after close.
+          - variables:
+              z_start: "{{ utcnow().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - service: script.open_zone
+            data:
+              zone_id: "{{ zone_id | int }}"
+          - delay:
+              minutes: "{{ runtime_minutes | float }}"
+          - service: script.close_zone
+            data:
+              zone_id: "{{ zone_id | int }}"
+          # Reporting-only Event 3: continue_on_error so a telemetry hiccup can
+          # never abort an otherwise-complete zone run (mirrors the rule that wraps
+          # finalize_cycle_record - a DB/reporting failure must not stall watering).
+          - service: script.fire_zone_run_complete
+            continue_on_error: true
+            data:
+              zone_id: "{{ zone_id | int }}"
+              weather_program: "{{ weather_program }}"
+              program_multiplier: "{{ program_multiplier }}"
+              start_time: "{{ z_start }}"
+              planned_duration_sec: "{{ (runtime_minutes | float * 60) | round(0) | int }}"
+              cycle_uuid: "{{ cycle_uuid }}"
+
+  # ==========================================================================
+  # Script 5: Run Zone Sequence
+  # ==========================================================================
+  # Executes watering for all active zones based on sequencing mode
+  #
+  # Called by: state machine (watering_zones state)
+  #
+  # Parameters:
+  #   window (required): Which watering window ('morning' or 'evening')
+  #
+  # Sequencing Modes:
+  #   - Parallel: All zones open simultaneously, each closes at its own runtime
+  #   - Sequential: Zones run one-by-one with 30s inter-zone delays
+  #
+  # Logic Flow:
+  #   1. Validate window parameter
+  #   2. Validate max_single_zone_runtime_min helper availability
+  #   3. Validate zone_sequencing_mode helper availability
+  #   4. Pre-calculate runtimes for all zones
+  #   5. Validate runtimes (cap at max_single_zone_runtime, absolute max 120min)
+  #   6. If parallel mode:
+  #      - Launch all zones simultaneously using HA parallel action
+  #      - Each zone waits its runtime then closes independently
+  #   7. If sequential mode:
+  #      - Run each zone in order with 30s delay between zones
+  #   8. If invalid mode:
+  #      - Log error and skip watering
+  #   9. Safety cleanup: close all zones
+  #
+  # Error Handling:
+  #   - Invalid window parameter: Log error and abort
+  #   - If open_zone errors, sequence stops (relies on ESPHome auto-off)
+  #   - Runtime values capped at max_single_zone_runtime_min for safety
+  #   - Absolute runtime cap at 120min prevents data corruption issues
+  #   - Invalid/unavailable sequencing_mode uses default with warning
+  #   - Cleanup runs at end regardless of sequencing mode
+  # ==========================================================================
+
+  run_zone_sequence:
+    alias: "Run Zone Sequence"
+    mode: single
+    icon: mdi:water
+    fields:
+      window:
+        description: "Watering window (morning or evening)"
+        example: "morning"
+        required: true
+    sequence:
+      # Validate window parameter with error logging
+      - if:
+          - condition: template
+            value_template: "{{ window not in ['morning', 'evening'] }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: zone_sequence_abort
+              message: "Invalid window parameter '{{ window }}', expected 'morning' or 'evening'. Aborting watering."
+              logger: watering_system.zone_scripts
+          - stop: "Invalid window parameter"
+            error: true
+
+      # Get configuration with validation
+      - variables:
+          max_runtime_state: "{{ states('input_number.max_single_zone_runtime_min') }}"
+          sequencing_mode_state: "{{ states('input_select.zone_sequencing_mode') }}"
+
+      # Validate max_runtime helper is available, use default if not
+      # Cap at absolute maximum of 120min to prevent data corruption issues.
+      # KEEP IN SYNC: the zone-runtime safety backstop
+      # (watering_safety/safety_automations.yaml, automation
+      # watering_safety_zone_runtime_limit) mirrors this SAME min(helper, 120)
+      # ceiling in its templated for:. HA packages can't share a scalar across
+      # files without a helper entity, so the 120 is duplicated by necessity -
+      # if you change the absolute cap here, change it there too or the backstop
+      # will false-trip (or under-protect) every full-runtime zone.
+      - if:
+          - condition: template
+            value_template: "{{ max_runtime_state in ['unavailable', 'unknown', ''] }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: zone_config_fallback
+              message: "max_single_zone_runtime_min unavailable, using default 120min"
+              entity_id: input_number.max_single_zone_runtime_min
+              logger: watering_system.zone_scripts
+          - variables:
+              max_runtime: 120.0
+        else:
+          - variables:
+              max_runtime: "{{ [max_runtime_state | float, 120] | min }}"
+
+      # Validate sequencing_mode helper is available, use default if not
+      - if:
+          - condition: template
+            value_template: "{{ sequencing_mode_state in ['unavailable', 'unknown', ''] }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: zone_config_fallback
+              message: "zone_sequencing_mode unavailable, using default 'parallel'"
+              entity_id: input_select.zone_sequencing_mode
+              logger: watering_system.zone_scripts
+          - variables:
+              sequencing_mode: "parallel"
+        else:
+          - variables:
+              sequencing_mode: "{{ sequencing_mode_state }}"
+
+      # Pre-calculate runtimes for all zones
+      - service: script.calculate_zone_runtime
+        data:
+          zone_id: 1
+          window: "{{ window }}"
+        response_variable: zone_1_result
+
+      - service: script.calculate_zone_runtime
+        data:
+          zone_id: 2
+          window: "{{ window }}"
+        response_variable: zone_2_result
+
+      - service: script.calculate_zone_runtime
+        data:
+          zone_id: 3
+          window: "{{ window }}"
+        response_variable: zone_3_result
+
+      - service: script.calculate_zone_runtime
+        data:
+          zone_id: 4
+          window: "{{ window }}"
+        response_variable: zone_4_result
+
+      # Store runtimes in variables, capped at max_runtime for safety.
+      # §3.5: capture cycle_uuid ONCE here - it is set before run_zone_sequence
+      # is called and cleared only by finalize_cycle_record (never mid-run), so
+      # every zone's Event 3 reuses this single read. §1.11: when this script is
+      # called directly as a manual Dev-Tools test (no cycle open), cycle_uuid_val
+      # is '' and the per-zone Event 3s are emitted uncorrelated (see
+      # fire_zone_run_complete) - expected for a test run with no parent cycle.
+      - variables:
+          cycle_uuid_val: "{{ states('input_text.cycle_uuid') }}"
+          zone_1_runtime: "{{ [zone_1_result.runtime_minutes | float, max_runtime] | min }}"
+          zone_2_runtime: "{{ [zone_2_result.runtime_minutes | float, max_runtime] | min }}"
+          zone_3_runtime: "{{ [zone_3_result.runtime_minutes | float, max_runtime] | min }}"
+          zone_4_runtime: "{{ [zone_4_result.runtime_minutes | float, max_runtime] | min }}"
+
+      # Execute based on sequencing mode
+      - choose:
+          # ===== PARALLEL MODE =====
+          # All zones open simultaneously, each closes when its runtime expires
+          - conditions:
+              - condition: template
+                value_template: "{{ sequencing_mode == 'parallel' }}"
+            sequence:
+              - parallel:
+                  # water_one_zone no-ops when a zone is not due (runtime <= 0),
+                  # so all four are launched unconditionally and run concurrently.
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 1
+                      runtime_minutes: "{{ zone_1_runtime }}"
+                      weather_program: "{{ zone_1_result.program }}"
+                      program_multiplier: "{{ zone_1_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 2
+                      runtime_minutes: "{{ zone_2_runtime }}"
+                      weather_program: "{{ zone_2_result.program }}"
+                      program_multiplier: "{{ zone_2_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 3
+                      runtime_minutes: "{{ zone_3_runtime }}"
+                      weather_program: "{{ zone_3_result.program }}"
+                      program_multiplier: "{{ zone_3_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 4
+                      runtime_minutes: "{{ zone_4_runtime }}"
+                      weather_program: "{{ zone_4_result.program }}"
+                      program_multiplier: "{{ zone_4_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+
+          # ===== SEQUENTIAL MODE =====
+          # Run zones one at a time with 30s inter-zone delay
+          - conditions:
+              - condition: template
+                value_template: "{{ sequencing_mode == 'sequential' }}"
+            sequence:
+              # Zones run one at a time. water_one_zone no-ops a zone that is not
+              # due; the runtime guard here only gates the 30s inter-zone delay, so
+              # a skipped zone adds no delay (matches the pre-refactor behaviour).
+              # Zone 1
+              - if:
+                  - condition: template
+                    value_template: "{{ zone_1_runtime > 0 }}"
+                then:
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 1
+                      runtime_minutes: "{{ zone_1_runtime }}"
+                      weather_program: "{{ zone_1_result.program }}"
+                      program_multiplier: "{{ zone_1_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - delay:
+                      seconds: 30
+
+              # Zone 2
+              - if:
+                  - condition: template
+                    value_template: "{{ zone_2_runtime > 0 }}"
+                then:
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 2
+                      runtime_minutes: "{{ zone_2_runtime }}"
+                      weather_program: "{{ zone_2_result.program }}"
+                      program_multiplier: "{{ zone_2_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - delay:
+                      seconds: 30
+
+              # Zone 3
+              - if:
+                  - condition: template
+                    value_template: "{{ zone_3_runtime > 0 }}"
+                then:
+                  - service: script.water_one_zone
+                    data:
+                      zone_id: 3
+                      runtime_minutes: "{{ zone_3_runtime }}"
+                      weather_program: "{{ zone_3_result.program }}"
+                      program_multiplier: "{{ zone_3_result.multiplier }}"
+                      cycle_uuid: "{{ cycle_uuid_val }}"
+                  - delay:
+                      seconds: 30
+
+              # Zone 4 - last zone, no trailing inter-zone delay. Called
+              # unconditionally; water_one_zone no-ops if zone 4 is not due.
+              - service: script.water_one_zone
+                data:
+                  zone_id: 4
+                  runtime_minutes: "{{ zone_4_runtime }}"
+                  weather_program: "{{ zone_4_result.program }}"
+                  program_multiplier: "{{ zone_4_result.multiplier }}"
+                  cycle_uuid: "{{ cycle_uuid_val }}"
+
+        # ===== DEFAULT CASE =====
+        # Invalid sequencing mode - log error and skip watering
+        default:
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: zone_sequence_abort
+              message: "Invalid sequencing_mode '{{ sequencing_mode }}', expected 'parallel' or 'sequential'. Skipping watering to prevent undefined behavior."
+              value_after: "{{ sequencing_mode }}"
+              logger: watering_system.zone_scripts
+
+      # Safety cleanup: ensure all zones are closed
+      # This runs regardless of which sequencing mode was used or if mode was invalid
+      - service: script.close_all_zones

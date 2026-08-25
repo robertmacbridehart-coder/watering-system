@@ -1,0 +1,973 @@
+# ============================================================================
+# Pump Control Scripts - Phase 3.2
+# ============================================================================
+# Purpose: Main pump and pressure relief valve control with safety checks
+# Location: home-assistant/packages/watering_scripts/pump_scripts.yaml
+#
+# Entity ID Reference: See /docs/entity_reference.md for canonical mappings
+# All entity IDs must match ESPHome device name + entity name pattern
+# Pattern: {device}_{component}_{number}_{description}
+# Example: watering_system_relay_1_main_pump
+#
+# Scripts:
+#   1. start_main_pump - Start pump with comprehensive safety checks
+#   2. stop_main_pump - Stop pump safely with aggressive retry for runaway pump
+#   3. open_pressure_relief - Open relief valve for configured duration
+#   4. close_pressure_relief - Close relief valve immediately
+#
+# Safety Features:
+#   - Tank level verification before pump start (with availability checks)
+#   - Pressure relief valve self-repair (if found open during start)
+#   - Pump stop aggressive retry (every 2s, up to 120min = ESPHome auto-off)
+#   - Valve interlock verification (R6 XOR R7, with availability checks)
+#   - Relay availability verification for all operations
+#   - 3-second relay verification delays (2s R10 + 1s coil response)
+#   - Interruptible 30-second pressure stabilization after pump start
+#   - Error state setting for all failure modes (with overwrite protection)
+#   - Persistent event logging via script.log_system_event (system_log +
+#     watering_ops.system_events row; see logging_scripts.yaml). The runaway
+#     retry heartbeat stays system_log-only to avoid DB spam.
+#   - Pressure relief duration validation (30-300s bounds, 120s default)
+#
+# Self-Repair Logic:
+#   - start_main_pump: If pressure relief open, attempt close, re-verify
+#   - stop_main_pump: Aggressive retry every 2s for up to 120min (runaway pump protection)
+#   - All self-repairs logged via script.log_system_event (persisted to system_events)
+#
+# Error States:
+#   - error_tank_low: Low-low tank level detected or sensor unavailable
+#   - error_valve_interlock: Invalid valve configuration or sensor unavailable
+#   - error_relay_state: Relay verification failed after self-repair
+#   - error_comms_lost: ESPHome communication lost (relays unavailable)
+#
+# Dependencies:
+#   - script.log_system_event (logging_scripts.yaml) - persistent event logging
+#   - input_number.pressure_relief_duration_sec (Phase 2)
+#   - All relay switches from ESPHome (availability checked)
+#   - Binary tank level sensors from ESPHome (availability checked)
+#
+# Flow Verification (Phase 4): TODO - tracked in impl_roadmap.md
+#
+# ============================================================================
+
+script:
+  # ==========================================================================
+  # Script 1: Start Main Pump
+  # ==========================================================================
+  # Starts main pump with comprehensive safety checks and pressure stabilization
+  # Called by: State machine (watering_plain, fert_prep states)
+  #
+  # Safety Checks (in order):
+  #   1. Tank level check (abort if low-low)
+  #   2. Pressure relief check (self-repair if open)
+  #   3. Valve interlock check (R6 XOR R7)
+  #   4. Relay verification (after 3s delay)
+  #
+  # Self-Repair Logic:
+  #   - If pressure relief valve found open: attempt to close
+  #   - Log both attempts and outcomes via script.log_system_event (persisted)
+  #   - If close fails, abort with error_valve_interlock
+  #
+  # Sequence:
+  #   1. All safety checks pass
+  #   2. Command pump on
+  #   3. Wait 3 seconds (R10 stabilization + coil response)
+  #   4. Verify pump relay energized
+  #   5. Wait 30 seconds for pressure stabilization
+  #   6. Return control to caller
+  #
+  # Error Handling:
+  #   - Tank low: Set error_tank_low, abort
+  #   - Relief valve won't close: Set error_valve_interlock, abort
+  #   - Invalid valve config: Set error_valve_interlock, abort
+  #   - Relay verification failed: Set error_relay_state, abort
+  # ==========================================================================
+
+  start_main_pump:
+    alias: "Start Main Pump"
+    mode: single
+    icon: mdi:pump
+    sequence:
+      # ===== SAFETY CHECK 1: Tank Level =====
+      # Verify low-low tank level switch is not triggered AND is available
+      - variables:
+          tank_sensor_state: "{{ states('binary_sensor.watering_system_low_low_water_level') }}"
+          tank_sensor_available: "{{ tank_sensor_state not in ['unavailable', 'unknown'] }}"
+          tank_level_ok: "{{ tank_sensor_available and is_state('binary_sensor.watering_system_low_low_water_level', 'off') }}"
+          current_state: "{{ states('input_select.watering_system_state') }}"
+          already_errored: "{{ current_state.startswith('error_') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not tank_level_ok }}"
+        then:
+          # Tank sensor unavailable or critically low - abort immediately
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_tank_low'
+
+          # system_log + durable system_events row in one call
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_start_abort
+              message: >-
+                Cannot start pump: tank level sensor
+                {{ 'unavailable' if not tank_sensor_available else 'triggered low-low' }}
+                (state: {{ tank_sensor_state }}). System halted.
+              entity_id: binary_sensor.watering_system_low_low_water_level
+              value_after: "{{ tank_sensor_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Tank level critical or sensor unavailable - cannot start pump"
+            error: true
+
+# ===== SAFETY CHECK 2: Pressure Relief Valve =====
+      # Verify relief valve is closed before starting pump AND is available
+      # If open, attempt self-repair before aborting
+      - variables:
+          relief_state: "{{ states('switch.watering_system_relay_9_pressure_relief') }}"
+          relief_available: "{{ relief_state not in ['unavailable', 'unknown'] }}"
+          relief_unexpectedly_open: "{{ relief_available and is_state('switch.watering_system_relay_9_pressure_relief', 'on') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not relief_available }}"
+        then:
+          # Relief valve unavailable - cannot verify state
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_comms_lost'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_start_abort
+              message: >-
+                Cannot start pump: pressure relief valve unavailable
+                (state: {{ relief_state }}). Manual intervention required.
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              value_after: "{{ relief_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Pressure relief valve unavailable"
+            error: true
+
+      - if:
+          - condition: template
+            value_template: "{{ relief_unexpectedly_open }}"
+        then:
+          # Relief valve is unexpectedly open - attempt self-repair
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: pump_self_repair
+              message: "Pressure relief valve unexpectedly open, attempting to close"
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              value_before: "on"
+              logger: watering_system.pump_scripts
+
+          # Brief delay to ensure relay state has propagated
+          - delay:
+              milliseconds: 500
+
+          # Attempt to close the relief valve
+          - service: script.close_pressure_relief
+
+          # Wait for script to complete (with timeout and failure handling)
+          - wait_template: "{{ is_state('script.close_pressure_relief', 'off') }}"
+            timeout: 10
+            continue_on_timeout: false
+
+          # Check if timeout occurred
+          - if:
+              - condition: template
+                value_template: "{{ wait.completed == false }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ not already_errored }}"
+                then:
+                  - service: input_select.select_option
+                    target:
+                      entity_id: input_select.watering_system_state
+                    data:
+                      option: 'error_relay_state'
+
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: pump_relay_fault
+                  message: "close_pressure_relief script timeout during self-repair. Manual intervention required."
+                  entity_id: switch.watering_system_relay_9_pressure_relief
+                  logger: watering_system.pump_scripts
+
+              - stop: "Script timeout during self-repair"
+                error: true
+
+          # Re-assess after close attempt
+          - if:
+              - condition: template
+                value_template: "{{ not is_state('switch.watering_system_relay_9_pressure_relief', 'off') }}"
+            then:
+              # Self-repair failed - valve still open
+              - if:
+                  - condition: template
+                    value_template: "{{ not already_errored }}"
+                then:
+                  - service: input_select.select_option
+                    target:
+                      entity_id: input_select.watering_system_state
+                    data:
+                      option: 'error_valve_interlock'
+
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: pump_start_abort
+                  message: "Cannot start pump: pressure relief valve failed to close after self-repair attempt. Manual intervention required."
+                  entity_id: switch.watering_system_relay_9_pressure_relief
+                  value_after: "on"
+                  logger: watering_system.pump_scripts
+
+              - stop: "Pressure relief valve failed to close"
+                error: true
+
+            else:
+              # Self-repair succeeded - relief valve closed
+              - service: script.log_system_event
+                data:
+                  severity: info
+                  event_type: pump_self_repair
+                  message: "Pressure relief valve closed successfully, continuing pump start"
+                  entity_id: switch.watering_system_relay_9_pressure_relief
+                  value_after: "off"
+                  logger: watering_system.pump_scripts
+
+      # ===== SAFETY CHECK 3: Valve Interlock (R6 XOR R7) =====
+      # Verify exactly one flow path is open: bypass (R6) OR fert line (R7)
+      # Both valves must be available AND in valid XOR configuration
+      - variables:
+          r6_state: "{{ states('switch.watering_system_relay_6_fert_bypass') }}"
+          r7_state: "{{ states('switch.watering_system_relay_7_fert_line') }}"
+          r6_available: "{{ r6_state not in ['unavailable', 'unknown'] }}"
+          r7_available: "{{ r7_state not in ['unavailable', 'unknown'] }}"
+          r6_on: "{{ is_state('switch.watering_system_relay_6_fert_bypass', 'on') }}"
+          r7_on: "{{ is_state('switch.watering_system_relay_7_fert_line', 'on') }}"
+          valid_interlock: "{{ r6_available and r7_available and (r6_on != r7_on) }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not valid_interlock }}"
+        then:
+          # Invalid configuration: valves unavailable OR both same state (both on OR both off)
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: "{{ 'error_comms_lost' if (not r6_available or not r7_available) else 'error_valve_interlock' }}"
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_start_abort
+              message: >-
+                Cannot start pump: invalid valve configuration
+                (R6={{ r6_state }}, R7={{ r7_state }}). Exactly one valve must be
+                open and both must be available.
+              logger: watering_system.pump_scripts
+
+          - stop: "Invalid valve configuration - cannot start pump"
+            error: true
+
+      # ===== ALL SAFETY CHECKS PASSED - START PUMP =====
+      # Command the main pump relay on
+      - service: switch.turn_on
+        target:
+          entity_id: switch.watering_system_relay_1_main_pump
+
+      # ===== RELAY VERIFICATION =====
+      # Wait for relay to energize and verify state
+      # Delay accounts for: 2s R10 stabilization + 1s coil response = 3s
+      - delay:
+          seconds: 3
+
+      # Verify pump relay actually energized AND is available
+      - variables:
+          pump_state: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+          pump_available: "{{ pump_state not in ['unavailable', 'unknown'] }}"
+          pump_on: "{{ is_state('switch.watering_system_relay_1_main_pump', 'on') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not pump_available or not pump_on }}"
+        then:
+          # Relay verification failed - emergency cleanup before error
+          - parallel:
+              - service: switch.turn_off
+                target:
+                  entity_id: switch.watering_system_relay_1_main_pump
+              - service: switch.turn_off
+                target:
+                  entity_id: switch.watering_system_relay_9_pressure_relief
+
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: "{{ 'error_comms_lost' if not pump_available else 'error_relay_state' }}"
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relay_fault
+              message: >-
+                Relay verification failed: main pump (R1)
+                {{ 'unavailable' if not pump_available else 'did not energize after command' }}
+                (state: {{ pump_state }}). Emergency cleanup performed.
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ pump_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Main pump relay failed to energize"
+            error: true
+
+      # Flow verification deferred to Phase 4 (see impl_roadmap.md)
+
+      # ===== PRESSURE STABILIZATION =====
+      # Allow system pressure to build gradually (interruptible if pump fails)
+      # Prevents water hammer damage to pipes, valves, and pump
+      - variables:
+          stabilization_start: "{{ now().timestamp() }}"
+
+      - repeat:
+          while:
+            - condition: template
+              value_template: >
+                {{ (now().timestamp() - stabilization_start) < 30 and
+                   is_state('switch.watering_system_relay_1_main_pump', 'on') }}
+          sequence:
+            - delay:
+                seconds: 1
+
+      # Check if pump failed during stabilization
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('switch.watering_system_relay_1_main_pump', 'on') }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relay_fault
+              message: >-
+                Pump failed during pressure stabilization wait
+                (state: {{ states('switch.watering_system_relay_1_main_pump') }}).
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Pump failed during stabilization"
+            error: true
+
+            # Pump started successfully - ready for zone operations
+
+  # ==========================================================================
+  # Script 2: Stop Main Pump
+  # ==========================================================================
+  # Stops main pump safely with aggressive retry for runaway pump scenario
+  # Called by: State machine (end of watering/fert cycles), safety automations
+  #
+  # Note: Separate from pressure relief operations
+  # Caller decides if relief valve operation is needed
+  #
+  # Sequence:
+  #   1. Command pump off
+  #   2. Wait 3 seconds (2s R10 + 1s relay response time)
+  #   3. Verify pump relay de-energized
+  #   4. If verification fails: Enter aggressive retry loop
+  #      - Retry every 2 seconds for up to 120 minutes
+  #      - Log every 10th attempt (every 20 seconds) to avoid spam
+  #      - ESPHome auto-off timer (120 min) is ultimate backstop
+  #   5. If still running after 120 min: CRITICAL error (should never happen)
+  #
+  # Runaway Pump Protection:
+  #   This is the most critical safety scenario. If HA commands fail,
+  #   we keep retrying until ESPHome's hardware auto-off triggers.
+  #   R10 (24V cabinet) does NOT physically cut power to R1.
+  #
+  # Error Handling:
+  #   - Pump still running after 120 min: CRITICAL error, manual intervention required
+  # ==========================================================================
+
+  stop_main_pump:
+    alias: "Stop Main Pump"
+    mode: restart  # Restart mode ensures latest stop request takes priority (critical for safety automations)
+    icon: mdi:pump-off
+    sequence:
+      # ===== INITIAL STOP ATTEMPT =====
+      - service: switch.turn_off
+        target:
+          entity_id: switch.watering_system_relay_1_main_pump
+
+      # Wait for relay to de-energize (2s R10 + 1s coil = 3s)
+      - delay:
+          seconds: 3
+
+      # ===== COMMS-LOST FAIL-FAST GUARD (Phase 3.4 Part A) =====
+      # If R1 is unavailable/unknown after the settle delay we can neither
+      # command nor observe the pump. Fail fast into error_comms_lost instead of
+      # falling through to the runaway branch below, whose `is_state(R1,'on')`
+      # loop guard is false for an unavailable entity -> it would spin 0s and log
+      # two misleading critical/pump_runaway rows. The reactive-recovery
+      # automation (Phase 3.4 Part B, watering_safety/safety_automations.yaml)
+      # handles R1's return. NOTE: this stop-with-error is intentionally caught
+      # by callers using continue_on_error (verified 2026-08-03 that
+      # continue_on_error DOES suppress a called script's stop:error:true).
+      - variables:
+          pump_state: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+          pump_available: "{{ pump_state not in ['unavailable', 'unknown'] }}"
+          current_state: "{{ states('input_select.watering_system_state') }}"
+          already_errored: "{{ current_state.startswith('error_') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not pump_available }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_comms_lost'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_comms_lost
+              message: >-
+                Cannot stop pump: main pump relay (R1) unavailable
+                (state: {{ pump_state }}). Relay-board comms lost; failing fast
+                into error_comms_lost. Reactive recovery will act when R1 returns.
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ pump_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Main pump relay unavailable - comms lost"
+            error: true
+
+      # ===== VERIFY PUMP STOPPED =====
+      # Reached only when R1 is available (Part A guard passed above), so the
+      # runaway else-branch fires only for a genuine, reachable-but-on pump.
+      - if:
+          - condition: state
+            entity_id: switch.watering_system_relay_1_main_pump
+            state: 'off'
+        then:
+          # Pump stopped successfully on first attempt
+          - service: script.log_system_event
+            data:
+              severity: info
+              event_type: pump_stop
+              message: "Main pump stopped successfully"
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "off"
+              logger: watering_system.pump_scripts
+
+        else:
+          # ===== RUNAWAY PUMP - ENTER AGGRESSIVE RETRY LOOP =====
+          # Pump did not stop - this is CRITICAL
+          # Keep trying every 2s for up to 120 min (ESPHome auto-off duration)
+
+          - variables:
+              retry_start: "{{ now().timestamp() }}"
+              max_duration_seconds: 7200  # 120 minutes
+              retry_interval: 2  # seconds
+              log_every_n_attempts: 10  # Log every 20 seconds
+              current_state: "{{ states('input_select.watering_system_state') }}"
+              already_errored: "{{ current_state.startswith('error_') }}"
+
+          - service: script.log_system_event
+            data:
+              severity: critical
+              event_type: pump_runaway
+              message: "Main pump failed to stop on first attempt. Entering aggressive retry loop (every 2s, max 120 min). State: {{ states('switch.watering_system_relay_1_main_pump') }}"
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+              logger: watering_system.pump_scripts
+
+          # Set error state if not already in error
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+          # ===== AGGRESSIVE RETRY LOOP =====
+          - repeat:
+              while:
+                - condition: template
+                  value_template: >
+                    {{ (now().timestamp() - retry_start) < max_duration_seconds and
+                       is_state('switch.watering_system_relay_1_main_pump', 'on') }}
+              sequence:
+                # Retry stop command
+                - service: switch.turn_off
+                  target:
+                    entity_id: switch.watering_system_relay_1_main_pump
+
+                # Wait retry interval
+                - delay:
+                    seconds: "{{ retry_interval }}"
+
+                # Calculate current attempt and elapsed time
+                - variables:
+                    elapsed_seconds: "{{ (now().timestamp() - retry_start) | int }}"
+                    attempt_number: "{{ (elapsed_seconds / retry_interval) | int }}"
+                    elapsed_minutes: "{{ (elapsed_seconds / 60) | int }}"
+
+                # Periodic progress heartbeat. Intentionally system_log ONLY (not
+                # a system_events row): a runaway can retry for up to 120 min, so
+                # persisting every ~20s would write hundreds of rows. The DB
+                # captures the meaningful transitions instead -- runaway detected
+                # (above), resolved / failed (below).
+                - if:
+                    - condition: template
+                      value_template: "{{ attempt_number > 0 and (attempt_number % log_every_n_attempts) == 0 }}"
+                  then:
+                    - service: system_log.write
+                      data:
+                        message: "Pump stop retry attempt {{ attempt_number }} ({{ elapsed_minutes }} min elapsed). Pump state: {{ states('switch.watering_system_relay_1_main_pump') }}"
+                        level: warning
+                        logger: watering_system.pump_scripts
+
+          # ===== POST-LOOP VERIFICATION =====
+          # Check final state after loop exits
+          - if:
+              - condition: state
+                entity_id: switch.watering_system_relay_1_main_pump
+                state: 'off'
+            then:
+              # Pump finally stopped - success after retry
+              - variables:
+                  final_elapsed: "{{ ((now().timestamp() - retry_start) / 60) | round(1) }}"
+
+              - service: script.log_system_event
+                data:
+                  severity: warning
+                  event_type: pump_runaway
+                  message: "Main pump stopped after {{ final_elapsed }} min of retries"
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  value_after: "off"
+                  logger: watering_system.pump_scripts
+
+            else:
+              # ===== CRITICAL FAILURE =====
+              # Pump still running after 120 minutes of retries
+              # ESPHome auto-off should have triggered by now - this should never happen
+              - service: script.log_system_event
+                data:
+                  severity: critical
+                  event_type: pump_runaway
+                  message: "Main pump still running after 120 minutes of stop retries. ESPHome auto-off may have failed. Physical intervention required IMMEDIATELY. State: {{ states('switch.watering_system_relay_1_main_pump') }}"
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  value_after: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+                  logger: watering_system.pump_scripts
+
+              # Ensure error state is set
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+              - stop: "CRITICAL: Pump failed to stop after 120 minutes - manual intervention required"
+                error: true
+
+                # Pump stopped - caller can proceed with additional operations
+
+  # ==========================================================================
+  # Script 3: Open Pressure Relief
+  # ==========================================================================
+  # Opens pressure relief valve for configured duration to release system pressure
+  # Called by: State machine (post_cycle_relief state)
+  #
+  # Safety Checks:
+  #   1. Verify pump is off before opening relief (with availability check)
+  #   2. If pump running, stop it first
+  #   3. Validate duration bounds (30-300s, default 120s)
+  #
+  # Sequence:
+  #   1. Ensure pump is stopped
+  #   2. Open relief valve (with verification)
+  #   3. Wait for configured duration (bounds-checked)
+  #   4. Close relief valve (with verification)
+  #
+  # Duration Source: input_number.pressure_relief_duration_sec (configurable)
+  # Duration Bounds: 30-300 seconds (clamped if out of range)
+  #
+  # Error Handling:
+  #   - Pump won't stop: Set error_relay_state, abort
+  #   - Relief valve won't open: Set error_relay_state, abort
+  #   - Relief valve won't close: Set error_relay_state, abort
+  #   - Relief valve unavailable: Set error_comms_lost, abort
+  # ==========================================================================
+
+  open_pressure_relief:
+    alias: "Open Pressure Relief"
+    mode: single
+    icon: mdi:valve-open
+    sequence:
+      # ===== DURATION BOUNDS VALIDATION =====
+      # Get configured duration with bounds validation (30-300s, default 120s)
+      - variables:
+          raw_duration: "{{ states('input_number.pressure_relief_duration_sec') | float(120) }}"
+          relief_duration: >
+            {% set duration = raw_duration | float(120) %}
+            {% if duration < 30 %}
+              30
+            {% elif duration > 300 %}
+              300
+            {% else %}
+              {{ duration }}
+            {% endif %}
+          duration_clamped: "{{ raw_duration != (relief_duration | float) }}"
+          current_state: "{{ states('input_select.watering_system_state') }}"
+          already_errored: "{{ current_state.startswith('error_') }}"
+
+      # Log if duration was out of bounds
+      - if:
+          - condition: template
+            value_template: "{{ duration_clamped }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: pump_relief
+              message: "Pressure relief duration out of bounds ({{ raw_duration }}s), clamped to {{ relief_duration }}s"
+              value_before: "{{ raw_duration }}"
+              value_after: "{{ relief_duration }}"
+              logger: watering_system.pump_scripts
+
+      # ===== SAFETY CHECK: Ensure Pump is Stopped =====
+      # Never open relief valve while pump is running (water hammer risk)
+      - variables:
+          pump_state: "{{ states('switch.watering_system_relay_1_main_pump') }}"
+          pump_available: "{{ pump_state not in ['unavailable', 'unknown'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not pump_available }}"
+        then:
+          # Pump state unavailable
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_comms_lost'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relief_abort
+              message: "Cannot open pressure relief: pump state unavailable ({{ pump_state }}). Manual intervention required."
+              entity_id: switch.watering_system_relay_1_main_pump
+              value_after: "{{ pump_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Pump state unavailable - cannot verify safety"
+            error: true
+
+      - if:
+          - condition: state
+            entity_id: switch.watering_system_relay_1_main_pump
+            state: 'on'
+        then:
+          # Pump is running - stop it first
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: pump_relief
+              message: "Pump still running when relief valve requested. Stopping pump before opening relief."
+              entity_id: switch.watering_system_relay_1_main_pump
+              logger: watering_system.pump_scripts
+
+          # continue_on_error so stop_main_pump's stop:error:true paths (runaway;
+          # comms-lost fail-fast, Phase 3.4 Part A) do NOT halt this script before
+          # its own wait + verify below. If R1 dropped to unavailable mid-run,
+          # stop_main_pump fails fast; the verify step below then aborts cleanly.
+          - alias: "Stop main pump before relief (best effort)"
+            continue_on_error: true
+            service: script.stop_main_pump
+
+          # Wait for script to complete (with timeout)
+          - wait_template: "{{ is_state('script.stop_main_pump', 'off') }}"
+            timeout: 180  # 3 minutes (allows retry loop to work)
+            continue_on_timeout: false
+
+          # Check if timeout occurred
+          - if:
+              - condition: template
+                value_template: "{{ wait.completed == false }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ not already_errored }}"
+                then:
+                  - service: input_select.select_option
+                    target:
+                      entity_id: input_select.watering_system_state
+                    data:
+                      option: 'error_relay_state'
+
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: pump_relief_abort
+                  message: "stop_main_pump script timeout. Cannot open pressure relief. Manual intervention required."
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  logger: watering_system.pump_scripts
+
+              - stop: "Pump stop timeout - cannot open relief valve"
+                error: true
+
+          # Verify pump actually stopped
+          - if:
+              - condition: template
+                value_template: "{{ not is_state('switch.watering_system_relay_1_main_pump', 'off') }}"
+            then:
+              # Pump failed to stop - abort relief operation
+              - if:
+                  - condition: template
+                    value_template: "{{ not already_errored }}"
+                then:
+                  - service: input_select.select_option
+                    target:
+                      entity_id: input_select.watering_system_state
+                    data:
+                      option: 'error_relay_state'
+
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: pump_relief_abort
+                  message: "Cannot open pressure relief: main pump failed to stop. Manual intervention required."
+                  entity_id: switch.watering_system_relay_1_main_pump
+                  logger: watering_system.pump_scripts
+
+              - stop: "Pump failed to stop - cannot open relief valve"
+                error: true
+
+      # ===== CHECK RELIEF VALVE AVAILABILITY =====
+      - variables:
+          relief_state: "{{ states('switch.watering_system_relay_9_pressure_relief') }}"
+          relief_available: "{{ relief_state not in ['unavailable', 'unknown'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not relief_available }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_comms_lost'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relief_abort
+              message: "Cannot open pressure relief: valve unavailable ({{ relief_state }}). Manual intervention required."
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              value_after: "{{ relief_state }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Relief valve unavailable"
+            error: true
+
+      # ===== OPEN RELIEF VALVE =====
+      - service: switch.turn_on
+        target:
+          entity_id: switch.watering_system_relay_9_pressure_relief
+
+      # Wait for relay to energize (2s R10 + 1s coil = 3s)
+      - delay:
+          seconds: 3
+
+      # Verify relief valve opened
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('switch.watering_system_relay_9_pressure_relief', 'on') }}"
+        then:
+          # Valve failed to open - cleanup and abort
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_9_pressure_relief
+
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relay_fault
+              message: "Relay verification failed: pressure relief valve (R9) did not open (state: {{ states('switch.watering_system_relay_9_pressure_relief') }})."
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              value_after: "{{ states('switch.watering_system_relay_9_pressure_relief') }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Pressure relief valve failed to open"
+            error: true
+
+      # ===== WAIT FOR CONFIGURED DURATION =====
+      # Allow pressure to dissipate from system (bounds-checked duration)
+      - delay:
+          seconds: "{{ relief_duration | int }}"
+
+      # ===== CLOSE RELIEF VALVE =====
+      - service: script.close_pressure_relief
+
+      # Wait for script to complete (with timeout)
+      - wait_template: "{{ is_state('script.close_pressure_relief', 'off') }}"
+        timeout: 10
+        continue_on_timeout: false
+
+      # Check if timeout occurred
+      - if:
+          - condition: template
+            value_template: "{{ wait.completed == false }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relief_abort
+              message: "close_pressure_relief script timeout. Manual intervention required."
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              logger: watering_system.pump_scripts
+
+          - stop: "Script timeout during relief valve close"
+            error: true
+
+      # Verify relief valve closed
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('switch.watering_system_relay_9_pressure_relief', 'off') }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ not already_errored }}"
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: 'error_relay_state'
+
+          - service: script.log_system_event
+            data:
+              severity: error
+              event_type: pump_relay_fault
+              message: "Relay verification failed: pressure relief valve (R9) did not close (state: {{ states('switch.watering_system_relay_9_pressure_relief') }})."
+              entity_id: switch.watering_system_relay_9_pressure_relief
+              value_after: "{{ states('switch.watering_system_relay_9_pressure_relief') }}"
+              logger: watering_system.pump_scripts
+
+          - stop: "Pressure relief valve failed to close"
+            error: true
+
+            # Pressure relief cycle completed successfully
+
+  # ==========================================================================
+  # Script 4: Close Pressure Relief
+  # ==========================================================================
+  # Closes pressure relief valve immediately
+  # Called by: start_main_pump (self-repair), open_pressure_relief
+  #
+  # Sequence:
+  #   1. Command relief valve off
+  #   2. Wait 3 seconds (2s R10 + 1s relay response time)
+  #   3. Return control to caller (caller verifies state)
+  #
+  # Note: No verification in this script - caller is responsible
+  # This allows self-repair logic to assess the result
+  #
+  # Availability: Checked by caller before calling this script
+  # ==========================================================================
+
+  close_pressure_relief:
+    alias: "Close Pressure Relief"
+    mode: single
+    icon: mdi:valve-closed
+    sequence:
+      # ===== COMMAND RELIEF VALVE OFF =====
+      - service: switch.turn_off
+        target:
+          entity_id: switch.watering_system_relay_9_pressure_relief
+
+      # ===== WAIT FOR RELAY RESPONSE =====
+      # Delay accounts for: 2s R10 stabilization + 1s coil response = 3s
+      - delay:
+          seconds: 3
+          # Return control to caller - no verification here
+          # Caller will check state and handle accordingly

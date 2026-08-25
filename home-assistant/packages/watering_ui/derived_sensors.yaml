@@ -1,0 +1,300 @@
+# =============================================================================
+# watering_ui / derived_sensors.yaml -- Phase 7 (Gate 7.2) dashboard-derived
+# sensors. READ-ONLY surfacing of data that has no first-class HA entity: the
+# watering_ops operational DB (per-zone last / last-4 waterings) and simple
+# interval math (fert next-due). No hardware, state-machine, or relay writes.
+#
+# Package-key note: this file's BASENAME (`derived_sensors`) is the package key
+# and must stay globally unique across packages/ (!include_dir_named gotcha).
+#
+# Scope (Gate 7.2, approved 2026-08-22):
+#   * sql:      zone_{1-4}_watering        -- items 2 + 3 (last / last-4)
+#   * sql:      zone_{1-4}_last_booster    -- ADR-020 booster retry gate (see below)
+#   * template: zone_{1-4}_fert_next_due   -- item 4 (fert next-due)
+#
+# zone_{1-4}_last_booster (added 2026-08-23, ADR-020 review Fix #4b): the INVERSE
+# of the zone_N_watering filter -- the latest run that IS the heavy mid-interval
+# booster (weather_program='heavy' AND program_multiplier=0.5). state_window_check
+# reads it to make the booster RETRY on later target windows until it lands exactly
+# once per interval (fires while mid <= days_since < N and the last booster predates
+# the last main dose), instead of the former single-shot [mid, mid+1) band. It is
+# a read-only derived sensor like the others here, but note it feeds operational
+# scheduling logic, not only the dashboard.
+# Deferred (per user, 2026-08-22): the per-zone "Next Program" FORECAST template
+# sensors (item 1). Their BrightSky forecast inputs are built in
+# packages/weather/dwd_brightsky.yaml; the decision templates themselves wait
+# until the zone-interval-helper / weather §6.2 rework lands.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Per-zone watering history (items 2 + 3), read from watering_ops.db.
+# One SQL sensor per zone:
+#   state           = latest successful zone-run start_time (device_class
+#                     timestamp; emitted UTC-aware so relative-time display is
+#                     correct across the CET/CEST change).
+#   attr `history`  = JSON array of the last 4 successful runs, most-recent
+#                     first: t=start_time (UTC TEXT), p=weather_program,
+#                     d=actual_duration_sec, f=fertigated (0/1). Held as an
+#                     attribute, not state, to clear the 255-char state cap;
+#                     the dashboard parses it with `from_json`.
+# "Successful" = aborted = 0 AND end_time IS NOT NULL (excludes aborted and
+# still-in-flight / crash-truncated runs). COALESCE keeps `history` = '[]' (not
+# NULL) for a zone that has never watered, so `from_json` never fails.
+#
+# MAIN-DOSE ONLY (Phase 7 cadence anchor): both queries also exclude the heavy
+# mid-interval BOOSTER, recorded as weather_program='heavy' with
+# program_multiplier=0.5 (see fire_zone_run_complete). So state = last MAIN dose,
+# which state_window_check reads as the per-zone interval anchor - a 0.5x booster
+# must NOT reset the cadence clock. COALESCE(program_multiplier, 1.0) keeps
+# legacy rows (multiplier written NULL before this change) counted as main.
+# NOTE: json_group_array/json_object need SQLite JSON1 (bundled in modern
+# SQLite; verified locally on 3.50.4, confirmed live on the Green 2026-08-22).
+#
+# db_url PATH GOTCHA: the DB is read by HA CORE here, whose config dir is
+# `/config` -> `sqlite:////config/watering_ops.db`. Do NOT use the
+# `/homeassistant/...` path that `db_writer.py` uses: that path is the
+# AppDaemon ADD-ON's mount of the same directory, and Core cannot open it. A
+# wrong path fails SILENTLY -- the SQL config-flow import aborts, creating no
+# entity and no home-assistant.log error (cost one deploy cycle, 2026-08-22).
+# -----------------------------------------------------------------------------
+sql:
+  - name: "Zone 1 Watering"
+    unique_id: zone_1_watering
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT
+        (SELECT start_time
+           FROM zone_runs
+          WHERE zone_id = 1 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+          ORDER BY start_time DESC
+          LIMIT 1) AS last_watering,
+        COALESCE((SELECT json_group_array(
+                    json_object('t', start_time,
+                                'p', weather_program,
+                                'd', actual_duration_sec,
+                                'f', fertigated))
+             FROM (SELECT start_time, weather_program, actual_duration_sec, fertigated
+                     FROM zone_runs
+                    WHERE zone_id = 1 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+                    ORDER BY start_time DESC
+                    LIMIT 4)), '[]') AS history;
+    column: "last_watering"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 2 Watering"
+    unique_id: zone_2_watering
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT
+        (SELECT start_time
+           FROM zone_runs
+          WHERE zone_id = 2 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+          ORDER BY start_time DESC
+          LIMIT 1) AS last_watering,
+        COALESCE((SELECT json_group_array(
+                    json_object('t', start_time,
+                                'p', weather_program,
+                                'd', actual_duration_sec,
+                                'f', fertigated))
+             FROM (SELECT start_time, weather_program, actual_duration_sec, fertigated
+                     FROM zone_runs
+                    WHERE zone_id = 2 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+                    ORDER BY start_time DESC
+                    LIMIT 4)), '[]') AS history;
+    column: "last_watering"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 3 Watering"
+    unique_id: zone_3_watering
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT
+        (SELECT start_time
+           FROM zone_runs
+          WHERE zone_id = 3 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+          ORDER BY start_time DESC
+          LIMIT 1) AS last_watering,
+        COALESCE((SELECT json_group_array(
+                    json_object('t', start_time,
+                                'p', weather_program,
+                                'd', actual_duration_sec,
+                                'f', fertigated))
+             FROM (SELECT start_time, weather_program, actual_duration_sec, fertigated
+                     FROM zone_runs
+                    WHERE zone_id = 3 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+                    ORDER BY start_time DESC
+                    LIMIT 4)), '[]') AS history;
+    column: "last_watering"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 4 Watering"
+    unique_id: zone_4_watering
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT
+        (SELECT start_time
+           FROM zone_runs
+          WHERE zone_id = 4 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+          ORDER BY start_time DESC
+          LIMIT 1) AS last_watering,
+        COALESCE((SELECT json_group_array(
+                    json_object('t', start_time,
+                                'p', weather_program,
+                                'd', actual_duration_sec,
+                                'f', fertigated))
+             FROM (SELECT start_time, weather_program, actual_duration_sec, fertigated
+                     FROM zone_runs
+                    WHERE zone_id = 4 AND aborted = 0 AND end_time IS NOT NULL AND NOT (weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5)
+                    ORDER BY start_time DESC
+                    LIMIT 4)), '[]') AS history;
+    column: "last_watering"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+# -----------------------------------------------------------------------------
+# Per-zone LAST BOOSTER (ADR-020 booster retry gate). Latest successful run that
+# IS a heavy mid-interval booster: weather_program = 'heavy' AND
+# program_multiplier = 0.5 -- the exact INVERSE of the zone_N_watering main-dose
+# filter above. "Successful" = aborted = 0 AND end_time IS NOT NULL (same as the
+# anchor). state = that run's start_time (UTC-aware timestamp), else 'unknown'
+# for a zone that has never boosted. Same db_url path gotcha applies (Core reads
+# `/config`, NOT the AppDaemon `/homeassistant` mount).
+#
+# state_window_check compares this against sensor.zone_N_watering (last MAIN dose):
+# a booster is still PENDING for the current interval iff last_booster is unknown
+# OR last_booster < last_main. Combined with the mid <= days_since < N band, the
+# booster retries each target (evening) window until it fires exactly once.
+# -----------------------------------------------------------------------------
+  - name: "Zone 1 Last Booster"
+    unique_id: zone_1_last_booster
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT start_time AS last_booster
+        FROM zone_runs
+       WHERE zone_id = 1 AND aborted = 0 AND end_time IS NOT NULL
+         AND weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5
+       ORDER BY start_time DESC
+       LIMIT 1;
+    column: "last_booster"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 2 Last Booster"
+    unique_id: zone_2_last_booster
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT start_time AS last_booster
+        FROM zone_runs
+       WHERE zone_id = 2 AND aborted = 0 AND end_time IS NOT NULL
+         AND weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5
+       ORDER BY start_time DESC
+       LIMIT 1;
+    column: "last_booster"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 3 Last Booster"
+    unique_id: zone_3_last_booster
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT start_time AS last_booster
+        FROM zone_runs
+       WHERE zone_id = 3 AND aborted = 0 AND end_time IS NOT NULL
+         AND weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5
+       ORDER BY start_time DESC
+       LIMIT 1;
+    column: "last_booster"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+  - name: "Zone 4 Last Booster"
+    unique_id: zone_4_last_booster
+    db_url: "sqlite:////config/watering_ops.db"
+    query: >-
+      SELECT start_time AS last_booster
+        FROM zone_runs
+       WHERE zone_id = 4 AND aborted = 0 AND end_time IS NOT NULL
+         AND weather_program = 'heavy' AND COALESCE(program_multiplier, 1.0) = 0.5
+       ORDER BY start_time DESC
+       LIMIT 1;
+    column: "last_booster"
+    value_template: >-
+      {% if value in [none, ''] %}unknown
+      {% else %}{{ as_datetime(value ~ '+00:00').isoformat() }}{% endif %}
+    device_class: timestamp
+
+# -----------------------------------------------------------------------------
+# Per-zone fertigation next-due (item 4). Pure interval math on existing
+# helpers -- last_fert_zone_{n} (date-only input_datetime; `timestamp` attr is
+# local-midnight epoch) + fert_cycle_days. Buildable now even though dosing
+# hardware is unwired: this predicts the NEXT due date; it does not require any
+# dose to have been delivered.
+#
+# `availability` hides the sensor until a real last-fert date is set: an unset
+# input_datetime restores to the 1970 epoch, so anything before 2000-01-01
+# (946684800) is treated as "never fertilized" -> unavailable (no misleading
+# 1970+7d due date). device_class timestamp; as_datetime(<epoch>) yields a
+# UTC-aware instant. Day-granularity, so within-interval DST shift is immaterial.
+# -----------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: "Zone 1 Fert Next Due"
+        unique_id: zone_1_fert_next_due
+        device_class: timestamp
+        availability: >-
+          {{ state_attr('input_datetime.last_fert_zone_1', 'timestamp') is not none
+             and (state_attr('input_datetime.last_fert_zone_1', 'timestamp') | int(0)) >= 946684800 }}
+        state: >-
+          {% set ts = state_attr('input_datetime.last_fert_zone_1', 'timestamp') | int(0) %}
+          {% set days = states('input_number.fert_cycle_days') | int(7) %}
+          {{ as_datetime(ts + days * 86400).isoformat() }}
+
+      - name: "Zone 2 Fert Next Due"
+        unique_id: zone_2_fert_next_due
+        device_class: timestamp
+        availability: >-
+          {{ state_attr('input_datetime.last_fert_zone_2', 'timestamp') is not none
+             and (state_attr('input_datetime.last_fert_zone_2', 'timestamp') | int(0)) >= 946684800 }}
+        state: >-
+          {% set ts = state_attr('input_datetime.last_fert_zone_2', 'timestamp') | int(0) %}
+          {% set days = states('input_number.fert_cycle_days') | int(7) %}
+          {{ as_datetime(ts + days * 86400).isoformat() }}
+
+      - name: "Zone 3 Fert Next Due"
+        unique_id: zone_3_fert_next_due
+        device_class: timestamp
+        availability: >-
+          {{ state_attr('input_datetime.last_fert_zone_3', 'timestamp') is not none
+             and (state_attr('input_datetime.last_fert_zone_3', 'timestamp') | int(0)) >= 946684800 }}
+        state: >-
+          {% set ts = state_attr('input_datetime.last_fert_zone_3', 'timestamp') | int(0) %}
+          {% set days = states('input_number.fert_cycle_days') | int(7) %}
+          {{ as_datetime(ts + days * 86400).isoformat() }}
+
+      - name: "Zone 4 Fert Next Due"
+        unique_id: zone_4_fert_next_due
+        device_class: timestamp
+        availability: >-
+          {{ state_attr('input_datetime.last_fert_zone_4', 'timestamp') is not none
+             and (state_attr('input_datetime.last_fert_zone_4', 'timestamp') | int(0)) >= 946684800 }}
+        state: >-
+          {% set ts = state_attr('input_datetime.last_fert_zone_4', 'timestamp') | int(0) %}
+          {% set days = states('input_number.fert_cycle_days') | int(7) %}
+          {{ as_datetime(ts + days * 86400).isoformat() }}

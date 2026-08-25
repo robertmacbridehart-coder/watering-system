@@ -1,0 +1,64 @@
+---
+# AppDaemon app configuration for the watering_ops database.
+#
+# Repo source: home-assistant/appdaemon/watering_db/ (this file + db_schema_init.py).
+# Kept OUT of home-assistant/packages/ on purpose -- packages/ is loaded by HA's
+# `!include_dir_named`, which would try to parse this AppDaemon config as an HA
+# package and fail config validation.
+#
+# Deploy target: this file and db_schema_init.py + db_schema.sql must live under
+# the AppDaemon app_dir on the HA Green. With app_dir set to
+# /homeassistant/appdaemon/apps (see docs/db_setup_guide.md), the deployed
+# layout is:
+#   /homeassistant/appdaemon/apps/watering_db/apps.yaml
+#   /homeassistant/appdaemon/apps/watering_db/db_schema_init.py
+#   /homeassistant/appdaemon/apps/watering_db/db_schema.sql   (copy of docs/db_schema.sql)
+#
+# All app files here are deployed together by home-assistant/scripts/pull_public_repo.sh
+# (every file in the repo app folder, plus db_schema.sql copied from the canonical
+# docs/db_schema.sql so the deployed schema cannot drift).
+#
+# schema_path points at the deployed copy of the canonical docs/db_schema.sql.
+
+db_schema_init:
+  module: db_schema_init
+  class: DbSchemaInit
+  db_path: /homeassistant/watering_ops.db
+  schema_path: /homeassistant/appdaemon/apps/watering_db/db_schema.sql
+
+# Seasonal CSV export. Listens for the trigger_event (fired by the HA
+# winterization automation in home-assistant/packages/watering_db/db_automations.yaml)
+# and writes year-filtered CSVs of all four tables to export_dir. See
+# architecture.md Section 13.5.
+db_seasonal_export:
+  module: db_export
+  class: DbSeasonalExport
+  db_path: /homeassistant/watering_ops.db
+  export_dir: /homeassistant/watering_exports
+  trigger_event: watering_seasonal_export
+
+# Persistent system-event writer. Listens for trigger_event (fired by the HA
+# helper script.log_system_event) and INSERTs one row into system_events. This
+# is Event 5 of the payload contract (architecture.md Section 13.3.1); rows are
+# not tied to a cycle and are written immediately. See db_event_writer.py.
+db_event_writer:
+  module: db_event_writer
+  class: DbEventWriter
+  db_path: /homeassistant/watering_ops.db
+  trigger_event: watering_system_event
+
+# Cycle / zone-run writer. Listens for Events 1/3/4 of the payload contract
+# (architecture.md Section 13.3.1) fired by the Phase 4 state machine and
+# writes/closes watering_cycles + zone_runs rows, holding the
+# cycle_uuid / zrun_uuid -> primary-key correlation in memory. Also publishes
+# binary_sensor.watering_cycle_active (ON at Event 1, OFF at Event 4; §13.4).
+# Event 5 (system_events) stays in db_event_writer above; Event 2 (fert doses)
+# has no publisher yet and lands with the fertigation hardware. See db_writer.py.
+db_writer:
+  module: db_writer
+  class: DbWriter
+  db_path: /homeassistant/watering_ops.db
+  event_preflight: watering_preflight_complete
+  event_zone_run: watering_zone_run_complete
+  event_cycle: watering_cycle_complete
+  cycle_active_sensor: binary_sensor.watering_cycle_active
