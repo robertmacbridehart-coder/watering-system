@@ -1,0 +1,763 @@
+# -------------------- UART + Modbus Settings --------------------
+uart:
+  id: modbus_uart
+  tx_pin: GPIO25
+  rx_pin: GPIO26
+  baud_rate: 9600
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  rx_buffer_size: 512
+
+modbus:
+  id: modbus1
+  uart_id: modbus_uart
+  send_wait_time: 8ms
+
+# -------------------- Modbus Relay Board (RAW coils) --------------------
+# NOTE: These raw switches are NOT exposed to HA. The template wrappers below are.
+modbus_controller:
+  - id: relay_board
+    address: 0x01
+    modbus_id: modbus1
+    command_throttle: 100ms
+
+switch:
+  # -------------------- RAW Modbus Coils (Internal Only) --------------------
+  # Relays 1-9, 11-16: Standard relay coils
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_1_raw
+    register_type: coil
+    address: 0
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_2_raw
+    register_type: coil
+    address: 1
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_3_raw
+    register_type: coil
+    address: 2
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_4_raw
+    register_type: coil
+    address: 3
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_5_raw
+    register_type: coil
+    address: 4
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_6_raw
+    register_type: coil
+    address: 5
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_7_raw
+    register_type: coil
+    address: 6
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_8_raw
+    register_type: coil
+    address: 7
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_9_raw
+    register_type: coil
+    address: 8
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # Relay 10: 24V cabinet enable (not internal, used by scripts)
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_10
+    register_type: coil
+    address: 9
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_11_raw
+    register_type: coil
+    address: 10
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_12_raw
+    register_type: coil
+    address: 11
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_13_raw
+    register_type: coil
+    address: 12
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_14_raw
+    register_type: coil
+    address: 13
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_15_raw
+    register_type: coil
+    address: 14
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  - platform: modbus_controller
+    modbus_controller_id: relay_board
+    id: relay_16_raw
+    register_type: coil
+    address: 15
+    internal: true
+    restore_mode: ALWAYS_OFF
+
+  # -------------------- Template Switches (User-Facing) --------------------
+  - platform: template
+    id: relay_pump_main
+    name: "Relay 1 - Main Pump"
+    icon: mdi:pump
+    lambda: |-
+      return id(relay_1_raw).state;
+    turn_on_action:
+      - script.execute: relay_1_on_sequence
+    turn_off_action:
+      - script.stop: relay_1_on_sequence
+      - script.execute: turn_off_relay_1_safe
+
+  - platform: template
+    id: relay_zone_1
+    name: "Relay 2 - Zone 1"
+    icon: mdi:sprinkler-variant
+    lambda: |-
+      return id(relay_2_raw).state;
+    turn_on_action:
+      - script.execute: relay_2_on_sequence
+    turn_off_action:
+      - script.stop: relay_2_on_sequence
+      - script.execute: turn_off_relay_2_safe
+
+  - platform: template
+    id: relay_zone_2
+    name: "Relay 3 - Zone 2"
+    icon: mdi:sprinkler-variant
+    lambda: |-
+      return id(relay_3_raw).state;
+    turn_on_action:
+      - script.execute: relay_3_on_sequence
+    turn_off_action:
+      - script.stop: relay_3_on_sequence
+      - script.execute: turn_off_relay_3_safe
+
+  - platform: template
+    id: relay_zone_3
+    name: "Relay 4 - Zone 3"
+    icon: mdi:sprinkler-variant
+    lambda: |-
+      return id(relay_4_raw).state;
+    turn_on_action:
+      - script.execute: relay_4_on_sequence
+    turn_off_action:
+      - script.stop: relay_4_on_sequence
+      - script.execute: turn_off_relay_4_safe
+
+  - platform: template
+    id: relay_zone_4
+    name: "Relay 5 - Zone 4"
+    icon: mdi:sprinkler-variant
+    lambda: |-
+      return id(relay_5_raw).state;
+    turn_on_action:
+      - script.execute: relay_5_on_sequence
+    turn_off_action:
+      - script.stop: relay_5_on_sequence
+      - script.execute: turn_off_relay_5_safe
+
+  - platform: template
+    id: relay_fert_bypass_valve
+    name: "Relay 6 - Fert Bypass"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_6_raw).state;
+    turn_on_action:
+      - script.execute: relay_6_on_sequence
+    turn_off_action:
+      - script.stop: relay_6_on_sequence
+      - script.execute: turn_off_relay_6_safe
+
+  - platform: template
+    id: relay_fert_line_valve
+    name: "Relay 7 - Fert Line"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_7_raw).state;
+    turn_on_action:
+      - script.execute: relay_7_on_sequence
+    turn_off_action:
+      - script.stop: relay_7_on_sequence
+      - script.execute: turn_off_relay_7_safe
+
+  - platform: template
+    id: relay_8
+    name: "Relay 8"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_8_raw).state;
+    turn_on_action:
+      - script.execute: relay_8_on_sequence
+    turn_off_action:
+      - script.stop: relay_8_on_sequence
+      - script.execute: turn_off_relay_8_safe
+
+  - platform: template
+    id: relay_pressure_relief
+    name: "Relay 9 - Pressure Relief"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_9_raw).state;
+    turn_on_action:
+      - script.execute: relay_9_on_sequence
+    turn_off_action:
+      - script.stop: relay_9_on_sequence
+      - script.execute: turn_off_relay_9_safe
+
+  - platform: template
+    id: relay_24v_cabinet
+    name: "Relay 10 - 24V Cabinet"
+    icon: mdi:power
+    lambda: |-
+      return id(relay_10).state;
+    turn_on_action:
+      - script.stop: v24_off_delay
+      - script.execute: relay_10_on_sequence
+    turn_off_action:
+      - script.stop: relay_10_on_sequence
+      - script.stop: v24_off_delay
+      - switch.turn_off: relay_10
+
+  - platform: template
+    id: relay_11
+    name: "Relay 11"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_11_raw).state;
+    turn_on_action:
+      - script.execute: relay_11_on_sequence
+    turn_off_action:
+      - script.stop: relay_11_on_sequence
+      - script.execute: turn_off_relay_11_safe
+
+  - platform: template
+    id: relay_12
+    name: "Relay 12"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_12_raw).state;
+    turn_on_action:
+      - script.execute: relay_12_on_sequence
+    turn_off_action:
+      - script.stop: relay_12_on_sequence
+      - script.execute: turn_off_relay_12_safe
+
+  - platform: template
+    id: relay_13
+    name: "Relay 13"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_13_raw).state;
+    turn_on_action:
+      - script.execute: relay_13_on_sequence
+    turn_off_action:
+      - script.stop: relay_13_on_sequence
+      - script.execute: turn_off_relay_13_safe
+
+  - platform: template
+    id: relay_14
+    name: "Relay 14"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_14_raw).state;
+    turn_on_action:
+      - script.execute: relay_14_on_sequence
+    turn_off_action:
+      - script.stop: relay_14_on_sequence
+      - script.execute: turn_off_relay_14_safe
+
+  - platform: template
+    id: relay_15
+    name: "Relay 15"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_15_raw).state;
+    turn_on_action:
+      - script.execute: relay_15_on_sequence
+    turn_off_action:
+      - script.stop: relay_15_on_sequence
+      - script.execute: turn_off_relay_15_safe
+
+  - platform: template
+    id: relay_16
+    name: "Relay 16"
+    icon: mdi:valve
+    lambda: |-
+      return id(relay_16_raw).state;
+    turn_on_action:
+      - script.execute: relay_16_on_sequence
+    turn_off_action:
+      - script.stop: relay_16_on_sequence
+      - script.execute: turn_off_relay_16_safe
+
+# -------------------- 24V State Mirror --------------------
+binary_sensor:
+  - platform: template
+    id: v24_active
+    internal: true
+    lambda: |-
+      return id(relay_10).state;
+
+# -------------------- Helper Scripts --------------------
+script:
+  # Ensure 24V is ON before any Modbus frame
+  - id: v24_ensure_on
+    mode: restart
+    then:
+      - if:
+          condition:
+            binary_sensor.is_off: v24_active
+          then:
+            - switch.turn_on: relay_10
+            - delay: 300ms
+
+  # Turn 24V off a short time after the last command
+  - id: v24_off_delay
+    mode: restart
+    then:
+      - delay: 60s
+      - switch.turn_off: relay_10
+
+  # -------------------- ON Sequence Scripts (with 120min auto-off) --------------------
+  # Relay 1
+  - id: relay_1_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_1_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_1_safe
+
+  # Relay 2
+  - id: relay_2_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_2_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_2_safe
+
+  # Relay 3
+  - id: relay_3_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_3_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_3_safe
+
+  # Relay 4
+  - id: relay_4_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_4_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_4_safe
+
+  # Relay 5
+  - id: relay_5_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_5_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_5_safe
+
+  # Relay 6
+  - id: relay_6_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_6_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_6_safe
+
+  # Relay 7
+  - id: relay_7_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_7_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_7_safe
+
+  # Relay 8
+  - id: relay_8_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_8_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_8_safe
+
+  # Relay 9
+  - id: relay_9_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_9_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_9_safe
+
+  # Relay 10 (24V cabinet - special case)
+  - id: relay_10_on_sequence
+    mode: restart
+    then:
+      - switch.turn_on: relay_10
+      - delay: 120min
+      - switch.turn_off: relay_10
+
+  # Relay 11
+  - id: relay_11_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_11_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_11_safe
+
+  # Relay 12
+  - id: relay_12_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_12_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_12_safe
+
+  # Relay 13
+  - id: relay_13_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_13_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_13_safe
+
+  # Relay 14
+  - id: relay_14_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_14_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_14_safe
+
+  # Relay 15
+  - id: relay_15_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_15_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_15_safe
+
+  # Relay 16
+  - id: relay_16_on_sequence
+    mode: restart
+    then:
+      - script.execute: turn_on_relay_16_safe
+      - delay: 120min
+      - script.execute: turn_off_relay_16_safe
+
+  # -------------------- Individual Safe Relay Control Scripts --------------------
+  # Relay 1
+  - id: turn_on_relay_1_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_1_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_1_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_1_raw
+      - script.execute: v24_off_delay
+
+  # Relay 2
+  - id: turn_on_relay_2_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_2_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_2_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_2_raw
+      - script.execute: v24_off_delay
+
+  # Relay 3
+  - id: turn_on_relay_3_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_3_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_3_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_3_raw
+      - script.execute: v24_off_delay
+
+  # Relay 4
+  - id: turn_on_relay_4_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_4_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_4_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_4_raw
+      - script.execute: v24_off_delay
+
+  # Relay 5
+  - id: turn_on_relay_5_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_5_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_5_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_5_raw
+      - script.execute: v24_off_delay
+
+  # Relay 6
+  - id: turn_on_relay_6_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_6_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_6_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_6_raw
+      - script.execute: v24_off_delay
+
+  # Relay 7
+  - id: turn_on_relay_7_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_7_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_7_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_7_raw
+      - script.execute: v24_off_delay
+
+  # Relay 8
+  - id: turn_on_relay_8_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_8_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_8_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_8_raw
+      - script.execute: v24_off_delay
+
+  # Relay 9
+  - id: turn_on_relay_9_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_9_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_9_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_9_raw
+      - script.execute: v24_off_delay
+
+  # Relay 11
+  - id: turn_on_relay_11_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_11_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_11_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_11_raw
+      - script.execute: v24_off_delay
+
+  # Relay 12
+  - id: turn_on_relay_12_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_12_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_12_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_12_raw
+      - script.execute: v24_off_delay
+
+  # Relay 13
+  - id: turn_on_relay_13_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_13_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_13_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_13_raw
+      - script.execute: v24_off_delay
+
+  # Relay 14
+  - id: turn_on_relay_14_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_14_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_14_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_14_raw
+      - script.execute: v24_off_delay
+
+  # Relay 15
+  - id: turn_on_relay_15_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_15_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_15_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_15_raw
+      - script.execute: v24_off_delay
+
+  # Relay 16
+  - id: turn_on_relay_16_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_on: relay_16_raw
+      - script.execute: v24_off_delay
+
+  - id: turn_off_relay_16_safe
+    mode: single
+    then:
+      - script.execute: v24_ensure_on
+      - delay: 50ms
+      - switch.turn_off: relay_16_raw
+      - script.execute: v24_off_delay

@@ -1,0 +1,346 @@
+# ============================================================================
+# Ecowitt sensor layer  (ADR-021 moisture-primary + rain-source abstraction)
+# ----------------------------------------------------------------------------
+# Realizes the ADR-021 sensor->zone mapping, the rain-source abstraction, and
+# the sensor-liveness gate that ADR-021's fail-safe actually depends on.
+#
+# STATUS: additive + INERT. Nothing consumes these entities yet -- the deployed
+# §3.2 tree still runs weather-only, and the system is parked (manual_override,
+# relays unavailable). When the moisture-primary tree is wired (hold lifts), it
+# reads: sensor.zone_N_soil_moisture, binary_sensor.rain_active,
+# sensor.rain_24h, sensor.rain_72h.
+#
+# WHY liveness matters: the HA Ecowitt integration NEVER marks a dead wireless
+# sensor 'unavailable' (core#140702, won't-fix) -- it freezes the last value
+# forever. A dead WH52 would otherwise feed stale moisture straight into the
+# PRIMARY decision.
+#
+# HOW liveness is detected (corrected 2026-08-31): this integration does NOT
+# surface unchanged-value pushes -- last_reported == last_changed on every
+# entity, so it advances ONLY when the VALUE changes. A slow, 1%-quantized
+# moisture reading can sit flat for hours on a perfectly healthy probe (verified:
+# the 2026-08-31 "feed died" flag was a false alarm -- probes were reporting on
+# the normal ~70s cadence the whole time). So a per-value freshness test on the
+# MOISTURE entity alone false-stales a live-but-stable probe almost constantly.
+# Even soil-temperature alone is insufficient (it too only writes on 0.1C change;
+# observed >30 min flat on a live probe). Robust gate = OR the freshness of the
+# probe's THREE fastest-changing fields (moisture / temp / EC) over a GENEROUS
+# window: a dead probe never updates ANY field again, so a wide window still
+# catches it long before the twice-daily decision, while avoiding false-stale on
+# healthy-but-flat probes.
+#
+# TUNABLES:
+#   * PROBE_STALE_WINDOW_S = 10800 (3 h) -- OR-of-3-fields; catches a truly dead
+#     WH52 with days of margin vs a 2x/day decision, no false-stale on stable soil
+#   * UPTIME_24H_MIN = 23.83 h  (24h - 10 min slack for "fully available")
+#
+# FOLLOW-UPS:
+#   * WH40 heartbeat (binary_sensor.wh40_online, below) still keys on
+#     wh40_battery.last_reported/300s -- SAME FLAW (battery flat at 1.5V won't
+#     advance). Needs a changing companion (rain_rate/event_rain) or a wide
+#     window before the rain-source priority can be trusted. Left as-is for now
+#     (rain path, not moisture/field-capacity).
+#   * Robust WH40 rolling-72h (hourly total_rain snapshots differenced), then
+#     switch sensor.rain_72h to the WH40-priority pattern used by rain_24h.
+#     (statistics 'change' on total_rain is unreliable: the counter is sparse, so
+#     on dry days its buffer empties and reads a false 0.)
+# ============================================================================
+
+# ---- Zone tags: one per movable WH52 (zone-level; RestoreEntity, no initial) ----
+# One-time setup to match current placement (persists across restart thereafter):
+#   wireless_1 -> Raspberries (CH1 Summer)   wireless_3 -> Raspberries (CH3 kiwi/straw)
+#   wireless_2 -> Raspberries (CH2 Fall)      wireless_4 -> Blueberries (CH4)
+input_select:
+  moisture_wireless_1_zone:
+    name: Moisture Wireless 1 Zone
+    options:
+      - Raspberries
+      - Blueberries
+      - Vegetables
+      - Unassigned
+  moisture_wireless_2_zone:
+    name: Moisture Wireless 2 Zone
+    options:
+      - Raspberries
+      - Blueberries
+      - Vegetables
+      - Unassigned
+  moisture_wireless_3_zone:
+    name: Moisture Wireless 3 Zone
+    options:
+      - Raspberries
+      - Blueberries
+      - Vegetables
+      - Unassigned
+  moisture_wireless_4_zone:
+    name: Moisture Wireless 4 Zone
+    options:
+      - Raspberries
+      - Blueberries
+      - Vegetables
+      - Unassigned
+
+# ---- History-based uptime (feeds the "available for the full window" gate) ----
+sensor:
+  - platform: history_stats
+    name: WH40 Uptime 24h
+    unique_id: wh40_uptime_24h
+    entity_id: binary_sensor.wh40_online
+    state: "on"
+    type: time
+    end: "{{ now() }}"
+    duration:
+      hours: 24
+
+template:
+  # ---- Liveness heartbeats (last_reported staleness) ----
+  - binary_sensor:
+      - name: WH40 Online
+        unique_id: wh40_online
+        device_class: connectivity
+        state: >
+          {% set e = states.sensor.gw3000a_wh40_battery %}
+          {{ e is not none and e.state not in ['unknown', 'unavailable']
+             and e.last_reported is not none
+             and (now() - e.last_reported).total_seconds() < 300 }}
+
+      - name: WH40 Available 24h
+        unique_id: wh40_available_24h
+        device_class: connectivity
+        state: >
+          {{ is_state('binary_sensor.wh40_online', 'on')
+             and states('sensor.wh40_uptime_24h') | float(0) >= 23.83 }}
+
+      # Online = ANY of the probe's 3 fastest fields (moisture/temp/EC) reported
+      # within PROBE_STALE_WINDOW_S. Keying on moisture alone false-stales a
+      # live-but-flat probe (see header). A dead probe updates none of them.
+      # The field must also hold a real value: after an HA restart every restored
+      # Ecowitt entity gets a fresh last_reported even while still `unavailable`
+      # (the gateway no longer sends it), which would otherwise read a dead probe
+      # as online for the whole window (seen live on CH1, 2026-09-23).
+      - name: WH52 Soil 1 Online
+        unique_id: wh52_soil_1_online
+        device_class: connectivity
+        state: >
+          {% set win = 10800 %}
+          {% set es = [states.sensor.gw3000a_soil_moisture_1,
+                       states.sensor.gw3000a_soil_temperature_1,
+                       states.sensor.gw3000a_soil_electrical_conductivity_1] %}
+          {% set ns = namespace(fresh=false) %}
+          {% for e in es %}
+            {% if e is not none and e.state not in ['unknown', 'unavailable']
+                  and e.last_reported is not none
+                  and (now() - e.last_reported).total_seconds() < win %}
+              {% set ns.fresh = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.fresh }}
+
+      - name: WH52 Soil 2 Online
+        unique_id: wh52_soil_2_online
+        device_class: connectivity
+        state: >
+          {% set win = 10800 %}
+          {% set es = [states.sensor.gw3000a_soil_moisture_2,
+                       states.sensor.gw3000a_soil_temperature_2,
+                       states.sensor.gw3000a_soil_electrical_conductivity_2] %}
+          {% set ns = namespace(fresh=false) %}
+          {% for e in es %}
+            {% if e is not none and e.state not in ['unknown', 'unavailable']
+                  and e.last_reported is not none
+                  and (now() - e.last_reported).total_seconds() < win %}
+              {% set ns.fresh = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.fresh }}
+
+      - name: WH52 Soil 3 Online
+        unique_id: wh52_soil_3_online
+        device_class: connectivity
+        state: >
+          {% set win = 10800 %}
+          {% set es = [states.sensor.gw3000a_soil_moisture_3,
+                       states.sensor.gw3000a_soil_temperature_3,
+                       states.sensor.gw3000a_soil_electrical_conductivity_3] %}
+          {% set ns = namespace(fresh=false) %}
+          {% for e in es %}
+            {% if e is not none and e.state not in ['unknown', 'unavailable']
+                  and e.last_reported is not none
+                  and (now() - e.last_reported).total_seconds() < win %}
+              {% set ns.fresh = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.fresh }}
+
+      - name: WH52 Soil 4 Online
+        unique_id: wh52_soil_4_online
+        device_class: connectivity
+        state: >
+          {% set win = 10800 %}
+          {% set es = [states.sensor.gw3000a_soil_moisture_4,
+                       states.sensor.gw3000a_soil_temperature_4,
+                       states.sensor.gw3000a_soil_electrical_conductivity_4] %}
+          {% set ns = namespace(fresh=false) %}
+          {% for e in es %}
+            {% if e is not none and e.state not in ['unknown', 'unavailable']
+                  and e.last_reported is not none
+                  and (now() - e.last_reported).total_seconds() < win %}
+              {% set ns.fresh = true %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.fresh }}
+
+      # ---- Rain: currently raining (source-selected). Realizes ADR-021 rain_now>0. ----
+      - name: Rain Active
+        unique_id: rain_active
+        device_class: moisture
+        state: >
+          {% if is_state('binary_sensor.wh40_online', 'on') %}
+            {{ states('sensor.gw3000a_rain_rate') | float(0) > 0 }}
+          {% else %}
+            {{ is_state('binary_sensor.brightsky_raining_now', 'on') }}
+          {% endif %}
+
+  - sensor:
+      # ---- Rain accumulations (source-selected) ----
+      - name: Rain 24h
+        unique_id: rain_24h_selected
+        unit_of_measurement: mm
+        device_class: precipitation
+        state_class: measurement
+        # WH40 gateway 24h is a true rolling window (reliable) if the gauge was
+        # up the whole 24h; else DWD.
+        state: >
+          {% if is_state('binary_sensor.wh40_available_24h', 'on') %}
+            {{ states('sensor.gw3000a_24h_rain') | float(0) }}
+          {% else %}
+            {{ states('sensor.brightsky_rain_24h') | float(0) }}
+          {% endif %}
+
+      - name: Rain 72h
+        unique_id: rain_72h_selected
+        unit_of_measurement: mm
+        device_class: precipitation
+        state_class: measurement
+        # DWD-only for now. WH40 72h has no reliable native/derived source yet
+        # (see header FOLLOW-UP). Switch to the WH40-priority pattern once the
+        # rolling-72h derivation exists.
+        state: "{{ states('sensor.brightsky_rain_72h') | float(0) }}"
+
+      # ---- Soil-moisture pool: resolves tags + freshness ONCE. ----
+      # Zone-level tag -> zone number: Raspberries=1, Blueberries=2,
+      # Vegetables=3 (shared veg pool; zone 4 also reads pool 3, own thresholds).
+      # When the wired SEN0600 land, append them to ns.z1/z2/z3 by fixed zone --
+      # this is the single place membership lives.
+      - name: Soil Moisture Pool
+        unique_id: soil_moisture_pool
+        # State = count of fresh, tagged wireless sensors (diagnostic).
+        state: >
+          {% set w = [
+               ('sensor.gw3000a_soil_moisture_1', 'binary_sensor.wh52_soil_1_online', 'input_select.moisture_wireless_1_zone'),
+               ('sensor.gw3000a_soil_moisture_2', 'binary_sensor.wh52_soil_2_online', 'input_select.moisture_wireless_2_zone'),
+               ('sensor.gw3000a_soil_moisture_3', 'binary_sensor.wh52_soil_3_online', 'input_select.moisture_wireless_3_zone'),
+               ('sensor.gw3000a_soil_moisture_4', 'binary_sensor.wh52_soil_4_online', 'input_select.moisture_wireless_4_zone')] %}
+          {% set ns = namespace(n=0) %}
+          {% for s, o, tag in w %}
+            {% if is_state(o, 'on') and is_number(states(s))
+                  and states(tag) in ['Raspberries', 'Blueberries', 'Vegetables'] %}
+              {% set ns.n = ns.n + 1 %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.n }}
+        attributes:
+          # Fresh, in-zone moisture values grouped by zone, as a NATIVE dict
+          # {'1': [...], '2': [...], '3': [...]}. (The name is historical: HA parses
+          # any dict/JSON-looking template output back into a native type, so a
+          # `| to_json` round-trip broke the readers' from_json — 2026-09-23. The
+          # readers below accept either a dict or a JSON string.)
+          zone_values_json: >
+            {% set w = [
+                 ('sensor.gw3000a_soil_moisture_1', 'binary_sensor.wh52_soil_1_online', 'input_select.moisture_wireless_1_zone'),
+                 ('sensor.gw3000a_soil_moisture_2', 'binary_sensor.wh52_soil_2_online', 'input_select.moisture_wireless_2_zone'),
+                 ('sensor.gw3000a_soil_moisture_3', 'binary_sensor.wh52_soil_3_online', 'input_select.moisture_wireless_3_zone'),
+                 ('sensor.gw3000a_soil_moisture_4', 'binary_sensor.wh52_soil_4_online', 'input_select.moisture_wireless_4_zone')] %}
+            {% set ns = namespace(z1=[], z2=[], z3=[]) %}
+            {% for s, o, tag in w %}
+              {% set t = states(tag) %}
+              {# is_number() gate: a non-numeric-but-not-unavailable state would
+                 otherwise error `| float` (no default) and null the whole attr. #}
+              {% if is_state(o, 'on') and is_number(states(s)) %}
+                {% if t == 'Raspberries' %}
+                  {% set ns.z1 = ns.z1 + [states(s) | float] %}
+                {% elif t == 'Blueberries' %}
+                  {% set ns.z2 = ns.z2 + [states(s) | float] %}
+                {% elif t == 'Vegetables' %}
+                  {% set ns.z3 = ns.z3 + [states(s) | float] %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ {'1': ns.z1, '2': ns.z2, '3': ns.z3} }}
+
+      # ---- Per-zone aggregates: thin readers of the pool. ----
+      # Empty/all-stale zone -> none -> 'unknown' -> ADR-021 weather-only fallback.
+      - name: Zone 1 Soil Moisture
+        unique_id: zone_1_soil_moisture
+        unit_of_measurement: "%"
+        device_class: moisture
+        state_class: measurement
+        state: >
+          {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+          {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+          {% set l = d['1'] if '1' in d else [] %}
+          {{ (l | sum / l | count) | round(1) if l | count > 0 else none }}
+        attributes:
+          contributing_sensors: >
+            {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+            {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+            {{ (d['1'] | count) if '1' in d else 0 }}
+
+      - name: Zone 2 Soil Moisture
+        unique_id: zone_2_soil_moisture
+        unit_of_measurement: "%"
+        device_class: moisture
+        state_class: measurement
+        state: >
+          {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+          {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+          {% set l = d['2'] if '2' in d else [] %}
+          {{ (l | sum / l | count) | round(1) if l | count > 0 else none }}
+        attributes:
+          contributing_sensors: >
+            {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+            {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+            {{ (d['2'] | count) if '2' in d else 0 }}
+
+      - name: Zone 3 Soil Moisture
+        unique_id: zone_3_soil_moisture
+        unit_of_measurement: "%"
+        device_class: moisture
+        state_class: measurement
+        state: >
+          {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+          {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+          {% set l = d['3'] if '3' in d else [] %}
+          {{ (l | sum / l | count) | round(1) if l | count > 0 else none }}
+        attributes:
+          contributing_sensors: >
+            {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+            {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+            {{ (d['3'] | count) if '3' in d else 0 }}
+
+      # Zone 4 shares the zone-3 veg pool by design; its OWN thresholds live elsewhere.
+      - name: Zone 4 Soil Moisture
+        unique_id: zone_4_soil_moisture
+        unit_of_measurement: "%"
+        device_class: moisture
+        state_class: measurement
+        state: >
+          {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+          {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+          {% set l = d['3'] if '3' in d else [] %}
+          {{ (l | sum / l | count) | round(1) if l | count > 0 else none }}
+        attributes:
+          contributing_sensors: >
+            {% set v = state_attr('sensor.soil_moisture_pool', 'zone_values_json') %}
+            {% set d = v if v is mapping else ((v | from_json) if v is string and v | length > 0 else {}) %}
+            {{ (d['3'] | count) if '3' in d else 0 }}

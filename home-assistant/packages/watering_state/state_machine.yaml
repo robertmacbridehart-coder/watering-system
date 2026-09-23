@@ -1,0 +1,521 @@
+# ============================================================================
+# State Machine Automations - Phase 4 (ADR-015 D4 + D-D/D-E/D-F)
+# ============================================================================
+# Location: home-assistant/packages/watering_state/state_machine.yaml
+#
+# The control plane for the plain-watering state machine. The state_* scripts
+# (state_scripts.yaml) each SELF-ADVANCE at their tail; these automations only
+# (a) dispatch a state to its script, (b) start cycles on schedule, and
+# (c) handle error / restart / control-state transitions.
+#
+# Roster:
+#   1. dispatcher            - state change -> call script.state_<state> (queued)
+#   2. scheduler             - window times / manual button -> idle -> window_check
+#   3. on_error (table)      - any error_* (D-D): abort -> [safe_shutdown per
+#                              policy] -> finalize(error) [-> notify per tier] (§2.4)
+#   4. restart_recovery      - homeassistant.start, operational/error_* -> abort ->
+#                              safe_shutdown -> finalize (all continue_on_error)
+#   5. control_guard         - manual_override + winterized in one parametrized
+#                              D-F GUARD (engage from idle, reject when running) (§2.5)
+#
+# Not here (unchanged): comms Part B watering_safety_r1_comms_recovery lives in
+# watering_safety/safety_automations.yaml.
+#
+# State classes:
+#   operational: window_check, preflight_check, watering_plain, post_cycle_relief
+#                (fert_* are deferred/unused in Phase 4)
+#   error:       error_e_stop, error_tank_low, error_comms_lost,
+#                error_valve_interlock, error_relay_state
+#   control:     manual_override, winterized      | plus: idle
+# ============================================================================
+
+automation:
+  # ==========================================================================
+  # 1. DISPATCHER (ADR-015 D4)
+  # ==========================================================================
+  # On every watering_system_state change, call the matching state_* script.
+  # mode: queued so a rapid next-state change (the scripts self-advance) is
+  # never dropped. Error / control / idle / fert states have NO branch, so
+  # progression simply halts there (safety automations own recovery). Setting a
+  # state directly in Dev Tools also drives this - the manual test path.
+  # ==========================================================================
+  - id: watering_state_dispatcher
+    alias: "Watering State - Dispatcher"
+    mode: queued
+    max: 10
+    trigger:
+      - platform: state
+        entity_id: input_select.watering_system_state
+    action:
+      # §2.3: one templated call replaces the four near-identical choose branches.
+      # Only operational states have a matching state_<name> script (ADR-015 D4
+      # naming). Rather than hard-code that list, DERIVE it from the script
+      # registry - dispatch iff a script.state_<state> exists (same dynamic
+      # derivation as abort_cycle_scripts). Every other state (idle, control,
+      # error_*, fert_*) has no such script and is terminal for the dispatcher.
+      # Adding a new operational state_<name> script makes it self-dispatch here.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ ('script.state_' ~ trigger.to_state.state)
+                 in (states.script | map(attribute='entity_id') | list) }}
+        then:
+          - service: "script.state_{{ trigger.to_state.state }}"
+
+  # ==========================================================================
+  # 2. SCHEDULER
+  # ==========================================================================
+  # Owns cycle START. Fires at the morning/evening window start times (each
+  # gated by its enable_*_window boolean) and on the manual test button. Only
+  # starts when idle and neither override nor winterized is active. Sets the D2
+  # context helpers, then moves idle -> window_check.
+  # ==========================================================================
+  - id: watering_state_scheduler
+    alias: "Watering State - Scheduler"
+    mode: single
+    trigger:
+      - platform: time
+        at: input_datetime.morning_window_start
+        id: morning
+      - platform: time
+        at: input_datetime.evening_window_start
+        id: evening
+      - platform: state
+        entity_id: input_button.start_watering_cycle_now
+        id: manual
+    condition:
+      - condition: state
+        entity_id: input_select.watering_system_state
+        state: idle
+      - condition: state
+        entity_id: input_boolean.manual_override_active
+        state: "off"
+      - condition: state
+        entity_id: input_boolean.system_winterized
+        state: "off"
+    action:
+      - choose:
+          # Scheduled morning/evening. One branch keyed on trigger.id (the
+          # window name) replaces the two near-identical morning/evening branches
+          # - they differed only in the window option and which enable_*_window
+          # they gate on. Matches only the two time triggers (manual has
+          # trigger.id == 'manual', handled by its own branch below), and only
+          # when that window's enable_<window>_window boolean is on.
+          - conditions:
+              - condition: template
+                value_template: "{{ trigger.id in ['morning', 'evening'] }}"
+              - condition: template
+                value_template: >-
+                  {{ is_state('input_boolean.enable_' ~ trigger.id ~ '_window', 'on') }}
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.active_watering_window
+                data:
+                  option: "{{ trigger.id }}"
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.active_trigger_type
+                data:
+                  option: scheduled
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: window_check
+          # Manual button: window by time of day (morning before midday).
+          # DELIBERATE (§1.13): unlike the scheduled branches above, the manual
+          # button does NOT require enable_*_window to be on. Pressing "Start
+          # Watering Cycle Now" is an explicit operator override, so it may run
+          # a window the operator has otherwise disabled for the season. The
+          # scheduler's idle/override/winterized guards above still apply.
+          - conditions:
+              - condition: trigger
+                id: manual
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.active_watering_window
+                data:
+                  option: "{{ 'morning' if now().hour < 12 else 'evening' }}"
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.active_trigger_type
+                data:
+                  option: manual
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: window_check
+        # No default: a time trigger whose window is disabled does nothing.
+
+  # ==========================================================================
+  # 3. PER-ERROR ENTRY AUTOMATION (ADR-015 D-D) - table-driven (§2.4)
+  # ==========================================================================
+  # One automation handles every error_* entry. It triggers on the state
+  # changing TO any error state and looks up a small per-error POLICY table for
+  # the only two things that differ between them:
+  #   safe_shutdown  - whether to run the hardware-safing sequence, and
+  #   tier / message - which notification to send (critical / high / none).
+  # Everything else is identical: abort_cycle_scripts FIRST (continue_on_error
+  # so finalize always runs), finalize_cycle_record LAST so the cycle row always
+  # closes (invariant), and NO state set (the latch is preserved by
+  # safe_shutdown's ended_in_error guard + the scripts' live error re-checks).
+  #
+  # Making safe_shutdown an explicit table column - instead of an implicit
+  # property of which block was copy-pasted - is the point of §2.4: e_stop and
+  # comms_lost deliberately OMIT safe_shutdown (hardware is already safed on
+  # those paths, and forcing idle would block comms Part B recovery), and a
+  # future error state can no longer inherit or drop that behaviour by accident.
+  #
+  # mode: parallel (max 5) preserves the old five-independent-automations
+  # behaviour: an escalation to a second error (e.g. tank_low -> e_stop) is
+  # handled even while the first error's safe_shutdown is still running.
+  # ==========================================================================
+  - id: watering_state_on_error
+    alias: "Watering State - On Error (all error_*)"
+    mode: parallel
+    max: 5
+    trigger:
+      - platform: state
+        entity_id: input_select.watering_system_state
+        to:
+          - error_e_stop
+          - error_comms_lost
+          - error_tank_low
+          - error_valve_interlock
+          - error_relay_state
+    action:
+      - variables:
+          err: "{{ trigger.to_state.state }}"
+          policy:
+            error_e_stop:
+              safe_shutdown: false
+              tier: none
+              # §2.5: no message key - tier 'none' skips the templated notify
+              # below (emergency_stop already sent the CRITICAL alert), so
+              # policy[err].message is never read for this entry.
+            error_comms_lost:
+              safe_shutdown: false
+              tier: high
+              message: >-
+                Watering halted: ESP32 communication lost (error_comms_lost).
+                Automatic recovery is armed for when the relay board reconnects.
+            error_tank_low:
+              safe_shutdown: true
+              tier: critical
+              message: >-
+                Watering halted: tank at Low-Low (error_tank_low). Safe shutdown
+                performed; refill required before the next cycle.
+            error_valve_interlock:
+              safe_shutdown: true
+              tier: critical
+              message: >-
+                Watering halted: valve interlock fault (error_valve_interlock).
+                Safe shutdown performed; check R6/R7 wiring and state.
+            error_relay_state:
+              safe_shutdown: true
+              tier: critical
+              message: >-
+                Watering halted: relay verification fault (error_relay_state).
+                Safe shutdown performed; a relay did not reach its commanded state.
+
+      # A2: cancel the in-flight progression first (continue_on_error).
+      - service: script.abort_cycle_scripts
+        continue_on_error: true
+
+      # Safe the hardware only for the states whose policy says so.
+      - if:
+          - condition: template
+            value_template: "{{ policy[err].safe_shutdown }}"
+        then:
+          - service: script.safe_shutdown
+            continue_on_error: true
+
+      # Close the DB row LAST (invariant: the cycle row always closes).
+      - service: script.finalize_cycle_record
+        continue_on_error: true
+        data:
+          outcome: error
+          notes: "{{ err }}"
+
+      # Notify per tier (e_stop = none: emergency_stop already sent critical).
+      # §2.1: one templated call replaces the 2-branch choose - the tier string
+      # ('critical'/'high') is exactly the notification-script suffix. §1.1:
+      # bypass_winterization so a genuine tank/valve/relay/comms fault latched
+      # while system_winterized is on still reaches the operator, mirroring the
+      # three watering_state_control_guard notify sites.
+      - if:
+          - condition: template
+            value_template: "{{ policy[err].tier != 'none' }}"
+        then:
+          - service: "script.send_{{ policy[err].tier }}_notification"
+            data:
+              message: "{{ policy[err].message }}"
+              bypass_winterization: true
+
+  # ==========================================================================
+  # 8. RESTART RECOVERY (ADR-015 D-E, thorough)
+  # ==========================================================================
+  # On HA start, if we came up in an OPERATIONAL or error_* state a cycle may
+  # have been interrupted (or a handler crashed mid-run leaving the DB row
+  # open). Abort, safe_shutdown, and finalize - all continue_on_error so one
+  # failure can't block the next.
+  #
+  # §1.4: TWO tiers of recovery, split by what each step is allowed to touch.
+  #
+  # (a) HARDWARE SAFING + idle backstop (abort -> safe_shutdown -> idle) runs
+  #     ONLY for operational/error_* states - the inner `if` below EXCLUDES the
+  #     control states (manual_override / winterized) and idle. A control state
+  #     means no cycle was in flight, so there is nothing to safe. Critically,
+  #     safe_shutdown is only a TWO-WAY classifier (it preserves error_* and
+  #     forces everything else to idle - it has no concept of a control state),
+  #     so running it in a control state would (a) needlessly actuate hardware -
+  #     pressure relief, R10 cycle - in the middle of hands-on manual work, and
+  #     (b) collapse the visible state to idle while the control boolean stays
+  #     on, desyncing the machine from its own source of truth. Both booleans are
+  #     RestoreEntity, so a control state simply persists across the restart.
+  #
+  # (b) finalize_cycle_record (close the DB row) runs UNCONDITIONALLY, outside
+  #     that gate. cycle_uuid is RestoreEntity too, so a cycle that was raced
+  #     into a control state mid-error (e.g. error_relay_state -> winterized just
+  #     before the restart) still has an open row; finalize is the sole closer of
+  #     the "cycle row always closes" invariant and no-ops when cycle_uuid is
+  #     empty, so calling it on every restart is safe for idle/control restarts.
+  #     This restores the pre-fix unconditional backstop that the narrower state
+  #     condition had removed, without re-introducing the needless hardware
+  #     actuation that motivated narrowing it.
+  #
+  # The explicit idle set inside (a) is a backstop for the case where
+  # safe_shutdown was interrupted (it preserves error_* latches, so only
+  # operational states fall through to idle).
+  # ==========================================================================
+  - id: watering_state_restart_recovery
+    alias: "Watering State - Restart Recovery"
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      # (a) Hardware safing + idle backstop - operational/error_* states only.
+      - if:
+          - condition: template
+            value_template: >-
+              {{ states('input_select.watering_system_state') not in
+                 ['idle', 'manual_override', 'winterized'] }}
+        then:
+          - service: script.abort_cycle_scripts
+            continue_on_error: true
+          - service: script.safe_shutdown
+            continue_on_error: true
+          # Backstop: any operational/fert state still set -> idle (error latch
+          # kept). Same COMPLEMENT as the control-guard reject: within this outer
+          # gate the state is already non-idle/non-control, so excluding error_*
+          # leaves exactly the operational/fert states - no explicit list to drift.
+          - if:
+              - condition: template
+                value_template: >-
+                  {{ states('input_select.watering_system_state')
+                     not in ['idle', 'manual_override', 'winterized']
+                     and not states('input_select.watering_system_state').startswith('error_') }}
+            then:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: idle
+
+      # (b) §1.4: ALWAYS close an orphaned cycle row, independent of the state we
+      # came up in (no-op when input_text.cycle_uuid is empty). This closes a row
+      # that was raced into a control state mid-error before the restart.
+      - service: script.finalize_cycle_record
+        continue_on_error: true
+        data:
+          outcome: error
+          notes: "HA restart during active cycle"
+
+  # ==========================================================================
+  # 9. CONTROL GUARD: manual_override + winterized (ADR-015 D-F) - merged (§2.5)
+  # ==========================================================================
+  # ONE parametrized guard for both control booleans (was two near-identical
+  # 5-branch automations). The boolean is the source of truth; the matching
+  # STATE (manual_override / winterized) mirrors it, but only when it is safe to
+  # engage. NEVER silently aborts a running cycle. trigger.entity_id selects
+  # which control this run is about:
+  #   input_boolean.manual_override_active <-> state manual_override
+  #   input_boolean.system_winterized      <-> state winterized
+  #
+  #   engage (boolean off->on):
+  #     idle          -> park in the control state
+  #     operational   -> REJECT: revert boolean off + notify "stop the cycle first"
+  #     error_*       -> engage + warn (bypass the winter gate so the warning lands)
+  #     other         -> REJECT: revert + notify "resolve current state first"
+  #   exit (boolean on->off): if parked in that control state, return to idle.
+  #
+  # NOTE (D-F watch-item): the seasonal CSV export (db_automations.yaml) and the
+  # de-winterization test (notification/tests.yaml) both trigger off the
+  # winterized STATE, entered/left ONLY through this guard, so a REJECTED
+  # winterize (which reverts the boolean on->off) fires neither (§1.4, §1.9).
+  #
+  # mode: queued (max 4) so a rare near-simultaneous toggle of both booleans is
+  # serialized rather than dropped.
+  # ==========================================================================
+  - id: watering_state_control_guard
+    alias: "Watering State - Control Guard (override / winterized)"
+    mode: queued
+    max: 4
+    trigger:
+      - platform: state
+        entity_id: input_boolean.manual_override_active
+        from: "off"
+        to: "on"
+        id: engage
+      - platform: state
+        entity_id: input_boolean.manual_override_active
+        from: "on"
+        to: "off"
+        id: exit
+      - platform: state
+        entity_id: input_boolean.system_winterized
+        from: "off"
+        to: "on"
+        id: engage
+      - platform: state
+        entity_id: input_boolean.system_winterized
+        from: "on"
+        to: "off"
+        id: exit
+    action:
+      - variables:
+          boolean_entity: "{{ trigger.entity_id }}"
+          # §2.2: one dict keyed by the trigger boolean replaces four parallel
+          # ternaries that shared the identical condition. A third control boolean
+          # is added by adding one key here, not by editing four expressions in
+          # lockstep (a missed one would be a silent wrong-message bug).
+          ctl:
+            input_boolean.manual_override_active:
+              control_state: manual_override
+              noun: "Manual override"
+              retry_verb: "enable manual override"
+              verify_hint: "verify hardware before operating."
+            input_boolean.system_winterized:
+              control_state: winterized
+              noun: "Winterization"
+              retry_verb: "winterize"
+              verify_hint: "verify hardware in spring before de-winterizing."
+          control_state: "{{ ctl[trigger.entity_id].control_state }}"
+          noun: "{{ ctl[trigger.entity_id].noun }}"
+          retry_verb: "{{ ctl[trigger.entity_id].retry_verb }}"
+          verify_hint: "{{ ctl[trigger.entity_id].verify_hint }}"
+      - choose:
+          # ---- exit: return to idle only if parked in that control state ----
+          - conditions:
+              - condition: trigger
+                id: exit
+            sequence:
+              - if:
+                  - condition: template
+                    value_template: "{{ is_state('input_select.watering_system_state', control_state) }}"
+                then:
+                  - service: input_select.select_option
+                    target:
+                      entity_id: input_select.watering_system_state
+                    data:
+                      option: idle
+          # ---- engage from idle -> park in the control state ----
+          - conditions:
+              - condition: trigger
+                id: engage
+              - condition: state
+                entity_id: input_select.watering_system_state
+                state: idle
+            sequence:
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: "{{ control_state }}"
+          # ---- engage while operational -> REJECT ----
+          # §1.5: this "cycle in flight" branch matches every operational/fert
+          # state so a future fertigation cycle in flight gets the specific
+          # "a watering cycle is running" rejection, not the generic default:.
+          # Keyed off binary_sensor.watering_operational (the single source of
+          # truth for the "not idle, not a control state, not error_*" complement,
+          # defined in watering_helpers/config_helpers.yaml), so a new operational
+          # state needs no edit here. Branch order makes this exact: idle is
+          # handled by the engage-from-idle branch above, error_* by the
+          # engage-from-error branch below, and the control states fall through to
+          # default: - so only operational/fert states can reach and match here.
+          - conditions:
+              - condition: trigger
+                id: engage
+              - condition: state
+                entity_id: binary_sensor.watering_operational
+                state: "on"
+            sequence:
+              - service: input_boolean.turn_off
+                target:
+                  entity_id: "{{ boolean_entity }}"
+              - service: script.send_high_notification
+                data:
+                  # Bypass the winter gate so this rejection is not swallowed when
+                  # system_winterized is still on - reachable for the manual_override
+                  # direction via a queued double-toggle mid-cycle (§1.3).
+                  bypass_winterization: true
+                  message: >-
+                    {{ noun }} was NOT engaged: a watering cycle is running.
+                    Stop the cycle first, then {{ retry_verb }}.
+          # ---- engage from an error state -> engage + warn + audit ----
+          # Capture the prior error BEFORE select_option overwrites the state. The
+          # exit branch returns to idle (not to the error), so engaging a control
+          # state HERE is the moment the error latch is cleared - a manual ACK, not
+          # a hardware fix. This is the only durable breadcrumb of WHICH error was
+          # superseded, so log it (system_events row) and name it in the notify.
+          - conditions:
+              - condition: trigger
+                id: engage
+              - condition: template
+                value_template: "{{ states('input_select.watering_system_state').startswith('error_') }}"
+            sequence:
+              - variables:
+                  prior_error: "{{ states('input_select.watering_system_state') }}"
+              - service: input_select.select_option
+                target:
+                  entity_id: input_select.watering_system_state
+                data:
+                  option: "{{ control_state }}"
+              - service: script.log_system_event
+                data:
+                  severity: warning
+                  event_type: control_engage_from_error
+                  message: >-
+                    {{ noun }} engaged from {{ prior_error }}. Error state latch
+                    cleared (returns to idle on release); underlying hardware fault
+                    NOT auto-resolved - {{ verify_hint }}
+                  entity_id: input_select.watering_system_state
+                  value_before: "{{ prior_error }}"
+                  value_after: "{{ control_state }}"
+                  logger: watering_system.state_machine
+              - service: script.send_high_notification
+                data:
+                  # Safety warning that fires when the system may be winterized;
+                  # bypass the winter gate so it is not swallowed (§1.3).
+                  bypass_winterization: true
+                  message: >-
+                    {{ noun }} engaged from {{ prior_error }}: error state cleared
+                    (returns to idle on release), but the underlying fault is NOT
+                    auto-resolved - {{ verify_hint }}
+        # ---- engage from anything else (e.g. the other control state) -> REJECT ----
+        default:
+          - service: input_boolean.turn_off
+            target:
+              entity_id: "{{ boolean_entity }}"
+          - service: script.send_high_notification
+            data:
+              # Rejection notice; bypass the winter gate so it is not
+              # swallowed when the other control boolean is still on (§1.3).
+              bypass_winterization: true
+              message: >-
+                {{ noun }} was NOT engaged: resolve the current system state
+                first.

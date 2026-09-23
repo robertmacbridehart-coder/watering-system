@@ -1,0 +1,238 @@
+###############################################################################
+# Watering System - System-Level Configuration Helpers
+#
+# File: home-assistant/packages/watering_helpers/config_helpers.yaml
+# Purpose: UI-configurable parameters for state machine control, scheduling,
+#          and safety limits
+#
+# Entity Count: 16 helpers (system-level configuration)
+#   - 4 input_select (state machine, sequencing mode, active window, trigger type)
+#   - 2 input_number (max runtime, pressure relief duration)
+#     (system-wide cycle-days RETIRED 2026-08-22 -> per-zone interval; see below)
+#   - 4 input_datetime (morning/evening window start/end - time only)
+#   - 3 input_boolean (morning/evening enable, manual override)
+#   - 2 input_text (cycle_uuid, zone_run_uuid - Phase 4 correlation ids)
+#   - 1 input_button (start_watering_cycle_now - Phase 4 manual cycle start)
+#   - 1 template binary_sensor (watering_operational - derived "operational
+#     state" predicate; single source of truth for the safety/control guards)
+#   (input_text.cycle_event_log retired 2026-07-31 - superseded by system_events
+#    via script.log_system_event; see ADR-013)
+#
+# Phase 4 additions (2026-08-09, ADR-014/ADR-015): active_watering_window,
+# active_trigger_type, cycle_uuid, zone_run_uuid, start_watering_cycle_now.
+#
+# Note: input_select.season moved to per-zone helpers (see watering_zone_helpers.yaml)
+# Note: input_boolean.system_winterized exists in home-assistant/packages/notification/helpers.yaml
+#       (Phase 9 - Notification System)
+#
+# Last Updated: 2026-08-09 (Phase 4 helpers added)
+# Architecture Reference: architecture.md Section 4.1; ADR-014 (uuid minting),
+#   ADR-015 (Phase 4 control structure) in programming-notes.md
+###############################################################################
+
+input_select:
+  watering_system_state:
+    name: "Watering System State"
+    icon: mdi:state-machine
+    options:
+      - idle
+      - window_check
+      - preflight_check
+      - watering_plain
+      - fert_prep
+      - fert_dose_phase1
+      - fert_dose_phase2
+      - post_cycle_relief
+      - manual_override
+      - winterized
+      - error_e_stop
+      - error_tank_low
+      - error_comms_lost
+      - error_valve_interlock
+      - error_relay_state
+    # NO initial: - this MUST be a RestoreEntity so the live state (an active
+    # cycle, a latched error_*, or a control state) survives an HA restart. With
+    # initial: set, HA returns early in async_added_to_hass and never restores,
+    # which defeated restart-recovery branch (a) (came up idle -> hardware not
+    # safed, error latch lost). First boot with no stored state falls back to
+    # options[0] = idle (safe). See ADR-017 / START_HERE restart-recovery bug.
+
+  zone_sequencing_mode:
+    name: "Zone Sequencing Mode"
+    icon: mdi:valve
+    options:
+      - parallel
+      - sequential
+    # NO initial: - RestoreEntity so the operator's sequencing choice survives a
+    # restart instead of snapping back to parallel. First boot with no stored
+    # state falls back to options[0] = parallel (same as the old default, so no
+    # first-boot change). See ADR-017.
+
+  # Phase 4 (ADR-015 D2): cycle context carried across the parameterless state
+  # transitions. Set by the scheduler at cycle start; read by run_zone_sequence
+  # (window) and state_preflight_check / Event 1 (trigger_type).
+  active_watering_window:
+    name: "Active Watering Window"
+    icon: mdi:clock-time-four-outline
+    options:
+      - morning
+      - evening
+    initial: morning
+
+  active_trigger_type:
+    name: "Active Trigger Type"
+    icon: mdi:gesture-tap-button
+    # 'override' is reserved for a future forced / weather-bypass run and is
+    # NOT used in Phase 4 (ADR-015). It is listed so Event 1's controlled
+    # vocabulary (scheduled/manual/override) is representable without editing
+    # the helper later.
+    options:
+      - scheduled
+      - manual
+      - override
+    initial: scheduled
+
+input_number:
+  # NOTE: the system-wide input_number.watering_cycle_days was RETIRED (Phase 7,
+  # 2026-08-22) in favour of per-zone cadence (input_number.zone_N_watering_interval_days
+  # in watering_zone_helpers). This closes ADR-015 D-C ("no cadence gate"): the
+  # per-zone interval is now consumed by state_window_check. No code referenced
+  # watering_cycle_days - it was only ever a display placeholder.
+  max_single_zone_runtime_min:
+    name: "Maximum Single Zone Runtime"
+    icon: mdi:timer-alert
+    min: 1
+    max: 180
+    step: 1
+    initial: 120
+    unit_of_measurement: "minutes"
+    mode: box
+
+  pressure_relief_duration_sec:
+    name: "Pressure Relief Valve Duration"
+    icon: mdi:valve
+    min: 5
+    max: 300
+    step: 10
+    initial: 120
+    unit_of_measurement: "seconds"
+    mode: box
+
+input_datetime:
+  morning_window_start:
+    name: "Morning Window Start"
+    icon: mdi:weather-sunset-up
+    has_date: false
+    has_time: true
+
+  morning_window_end:
+    name: "Morning Window End"
+    icon: mdi:weather-sunset-up
+    has_date: false
+    has_time: true
+
+  evening_window_start:
+    name: "Evening Window Start"
+    icon: mdi:weather-sunset-down
+    has_date: false
+    has_time: true
+
+  evening_window_end:
+    name: "Evening Window End"
+    icon: mdi:weather-sunset-down
+    has_date: false
+    has_time: true
+
+input_boolean:
+  # NO initial: on the enable_*_window booleans - RestoreEntity so a
+  # seasonally-disabled window stays disabled across a restart (with initial:
+  # true, a restart silently re-enabled a window the operator had turned off).
+  # First boot with no stored state falls back to off = window disabled = no
+  # watering, which is the fail-safe direction (opt-in watering). See ADR-017.
+  enable_morning_window:
+    name: "Enable Morning Watering Window"
+    icon: mdi:weather-sunset-up
+
+  enable_evening_window:
+    name: "Enable Evening Watering Window"
+    icon: mdi:weather-sunset-down
+
+  manual_override_active:
+    name: "Manual Override Mode"
+    icon: mdi:hand-back-right
+    # NO initial: - RestoreEntity so a manual_override control state persists
+    # across an HA restart (the control_guard + restart-recovery comments rely
+    # on this). First boot with no stored state falls back to off (safe).
+    # See ADR-017 / START_HERE restart-recovery bug.
+
+# Phase 4 (ADR-014 / ADR-015): opaque correlation identifiers minted by the
+# state machine and stamped on the §13.3.1 events so AppDaemon can resolve the
+# SQLite foreign keys. Format 'c-'/'z-' + microsecond UTC timestamp (<=24 chars,
+# well under the 255-char input_text cap). Empty = no cycle open, which is how
+# script.finalize_cycle_record detects a no-op.
+input_text:
+  cycle_uuid:
+    name: "Cycle UUID"
+    icon: mdi:identifier
+    max: 50
+    # initial defaults to '' (empty) - no open cycle at startup.
+
+  # Reserved for the fertigation path (strictly sequential, single-zone) per
+  # ADR-015 D1: Event 2 doses must read the same uuid as their run's Event 3.
+  # The plain-watering path mints a LOCAL per-zone zrun_uuid inside
+  # fire_zone_run_complete (called by run_zone_sequence) instead (parallel-safe),
+  # so this helper stays empty in Phase 4.
+  zone_run_uuid:
+    name: "Zone Run UUID"
+    icon: mdi:identifier
+    max: 50
+
+# Phase 4 (ADR-015): manual / on-demand cycle start. The scheduler automation
+# triggers on this, sets active_trigger_type = manual and active_watering_window
+# by time of day, then moves idle -> window_check (same state == idle guard as
+# the timed triggers).
+input_button:
+  start_watering_cycle_now:
+    name: "Start Watering Cycle Now"
+    icon: mdi:play-circle-outline
+
+# ---------------------------------------------------------------------------
+# Derived state helper - single source of truth for the "operational" predicate
+# ---------------------------------------------------------------------------
+# binary_sensor.watering_operational is ON exactly when watering_system_state is
+# an OPERATIONAL (cycle-in-flight) state: NOT idle, NOT a control state
+# (manual_override / winterized), and NOT a latched error_*. Expressed as the
+# COMPLEMENT so a NEW operational state (e.g. a future fert phase) is covered
+# with no edit here.
+#
+# FAIL-SAFE: 'unknown' and 'unavailable' are listed in the exclusion set too, so
+# the sensor is OFF whenever the source state is not a real option - e.g. the
+# brief HA-start window before input_select restores, or a helpers reload. A bare
+# complement would read those garbage states as operational (ON), and the tank
+# monitor - which, unlike the comms watchdog, has NO from:/startup trigger guard
+# and gates solely on this sensor - could then latch error_tank_low on a Low-Low
+# edge with no cycle running. OFF-on-unknown is the safe direction for every
+# consumer (a monitor stands down; the control guard falls through to reject).
+# (Matches the explicit `in ['unavailable', 'unknown', '']` guard style used in
+# run_zone_sequence / calculate_zone_runtime.)
+#
+# This replaces the identical complement template that had been hand-copied into
+# each safety monitor (watering_safety/safety_automations.yaml) and the
+# state-machine control guard (watering_state/state_machine.yaml). Those now read
+# this one sensor, so "which states count as operational" lives in ONE place;
+# adding an operational state needs no edit at any guard site.
+#
+# NOTE: the restart-recovery handler (state_machine.yaml) deliberately KEEPS its
+# inline complement template rather than reading this sensor - it runs inside the
+# `homeassistant start` handler, and must not depend on another template entity's
+# startup setup/evaluation ordering (mirrors the codebase's caution about derived
+# entities not being ready at HA start).
+template:
+  - binary_sensor:
+      - name: watering_operational
+        unique_id: watering_operational_bool
+        icon: mdi:water-pump
+        state: >-
+          {{ states('input_select.watering_system_state') not in
+             ['unknown', 'unavailable', 'idle', 'manual_override', 'winterized']
+             and not states('input_select.watering_system_state').startswith('error_') }}

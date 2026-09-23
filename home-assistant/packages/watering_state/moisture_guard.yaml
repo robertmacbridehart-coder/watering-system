@@ -1,0 +1,211 @@
+# ============================================================================
+# Soil-moisture GUARD  (ADR-021 Amendment A, 2026-09-23 — §3.6 S2-rework)
+# ----------------------------------------------------------------------------
+# Weather + cadence drive watering. Soil moisture only GUARDS it:
+#   * WET VETO  — zone clearly wet  -> program forced `off` (final, hard).
+#   * DRY BUMP  — zone clearly dry  -> +1 step (optional, per-zone enable, capped
+#                 at heavy).
+# script.compute_zone_programs reads the two binary sensors below; it does not
+# re-derive the thresholds, so the hysteresis lives in exactly one place.
+#
+# Moisture source: sensor.zone_N_soil_moisture (ecowitt.yaml) = average of the
+# FRESH WH52 probes tagged to the zone (zone 4 reads the zone-3 veg pool).
+# Unknown/stale moisture -> both sensors OFF -> guard inactive -> weather decides
+# alone (fail-safe, never fail-heavy).
+#
+# HYSTERESIS (so ±1 % sensor dither can't flip a decision): each sensor reads its
+# own previous state via `this.state`.
+#   wet: engages at moisture >= wet_veto, releases below wet_veto - hysteresis
+#   dry: engages at moisture <= dry_bump, releases above dry_bump + hysteresis
+# After an HA restart `this.state` is unknown, so the sensor re-evaluates on the
+# stricter (engage) threshold — conservative.
+#
+# UNSET = DISABLED (operator decision 2026-09-23): the helpers below have no
+# `initial:` (RestoreEntity, ADR-017), so on first boot they start at `min` = 0.
+# A threshold of 0 means DISABLED, so the guard is inert until values are set
+# after the per-bed gateway calibration (docs/soil_calibration_log.md §4). To turn
+# a zone's veto off later, set it back to 0. Values are on the gateway-calibrated
+# scale once §4 is applied (factory air/water scale before that).
+# ============================================================================
+
+input_number:
+  # --- Wet veto: moisture >= value -> skip (0 = disabled) ---
+  zone_1_moisture_wet_veto:
+    name: "Zone 1 Moisture Wet Veto"
+    icon: mdi:water-off
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_2_moisture_wet_veto:
+    name: "Zone 2 Moisture Wet Veto"
+    icon: mdi:water-off
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_3_moisture_wet_veto:
+    name: "Zone 3 Moisture Wet Veto"
+    icon: mdi:water-off
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_4_moisture_wet_veto:
+    name: "Zone 4 Moisture Wet Veto"
+    icon: mdi:water-off
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Dry bump: moisture <= value -> +1 step when enabled (0 = disabled) ---
+  zone_1_moisture_dry_bump:
+    name: "Zone 1 Moisture Dry Bump"
+    icon: mdi:water-alert
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_2_moisture_dry_bump:
+    name: "Zone 2 Moisture Dry Bump"
+    icon: mdi:water-alert
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_3_moisture_dry_bump:
+    name: "Zone 3 Moisture Dry Bump"
+    icon: mdi:water-alert
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  zone_4_moisture_dry_bump:
+    name: "Zone 4 Moisture Dry Bump"
+    icon: mdi:water-alert
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+
+  # --- Shared hysteresis band for both guards (percentage points) ---
+  moisture_guard_hysteresis:
+    name: "Moisture Guard Hysteresis"
+    icon: mdi:arrow-expand-vertical
+    min: 0
+    max: 10
+    step: 0.5
+    unit_of_measurement: "pts"
+    mode: box
+
+input_boolean:
+  # Dry bump is opt-in per zone (default OFF on first boot: RestoreEntity).
+  zone_1_moisture_dry_bump_enabled:
+    name: "Zone 1 Moisture Dry Bump Enabled"
+    icon: mdi:water-plus
+  zone_2_moisture_dry_bump_enabled:
+    name: "Zone 2 Moisture Dry Bump Enabled"
+    icon: mdi:water-plus
+  zone_3_moisture_dry_bump_enabled:
+    name: "Zone 3 Moisture Dry Bump Enabled"
+    icon: mdi:water-plus
+  zone_4_moisture_dry_bump_enabled:
+    name: "Zone 4 Moisture Dry Bump Enabled"
+    icon: mdi:water-plus
+
+template:
+  - binary_sensor:
+      # ---- WET (veto) — ON = zone clearly wet -> compute_zone_programs forces off ----
+      - name: Zone 1 Moisture Wet
+        unique_id: zone_1_moisture_wet
+        device_class: moisture
+        state: >
+          {% set m = states('sensor.zone_1_soil_moisture') %}
+          {% set t = states('input_number.zone_1_moisture_wet_veto') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) >= t - h }}
+          {% else %}{{ (m | float) >= t }}{% endif %}
+
+      - name: Zone 2 Moisture Wet
+        unique_id: zone_2_moisture_wet
+        device_class: moisture
+        state: >
+          {% set m = states('sensor.zone_2_soil_moisture') %}
+          {% set t = states('input_number.zone_2_moisture_wet_veto') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) >= t - h }}
+          {% else %}{{ (m | float) >= t }}{% endif %}
+
+      - name: Zone 3 Moisture Wet
+        unique_id: zone_3_moisture_wet
+        device_class: moisture
+        state: >
+          {% set m = states('sensor.zone_3_soil_moisture') %}
+          {% set t = states('input_number.zone_3_moisture_wet_veto') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) >= t - h }}
+          {% else %}{{ (m | float) >= t }}{% endif %}
+
+      - name: Zone 4 Moisture Wet
+        unique_id: zone_4_moisture_wet
+        device_class: moisture
+        state: >
+          {% set m = states('sensor.zone_4_soil_moisture') %}
+          {% set t = states('input_number.zone_4_moisture_wet_veto') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) >= t - h }}
+          {% else %}{{ (m | float) >= t }}{% endif %}
+
+      # ---- DRY (bump) — ON = zone clearly dry; applied only if the zone's enable is on ----
+      - name: Zone 1 Moisture Dry
+        unique_id: zone_1_moisture_dry
+        state: >
+          {% set m = states('sensor.zone_1_soil_moisture') %}
+          {% set t = states('input_number.zone_1_moisture_dry_bump') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) <= t + h }}
+          {% else %}{{ (m | float) <= t }}{% endif %}
+
+      - name: Zone 2 Moisture Dry
+        unique_id: zone_2_moisture_dry
+        state: >
+          {% set m = states('sensor.zone_2_soil_moisture') %}
+          {% set t = states('input_number.zone_2_moisture_dry_bump') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) <= t + h }}
+          {% else %}{{ (m | float) <= t }}{% endif %}
+
+      - name: Zone 3 Moisture Dry
+        unique_id: zone_3_moisture_dry
+        state: >
+          {% set m = states('sensor.zone_3_soil_moisture') %}
+          {% set t = states('input_number.zone_3_moisture_dry_bump') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) <= t + h }}
+          {% else %}{{ (m | float) <= t }}{% endif %}
+
+      - name: Zone 4 Moisture Dry
+        unique_id: zone_4_moisture_dry
+        state: >
+          {% set m = states('sensor.zone_4_soil_moisture') %}
+          {% set t = states('input_number.zone_4_moisture_dry_bump') | float(0) %}
+          {% set h = states('input_number.moisture_guard_hysteresis') | float(0) %}
+          {% if not is_number(m) or t <= 0 %}false
+          {% elif this.state == 'on' %}{{ (m | float) <= t + h }}
+          {% else %}{{ (m | float) <= t }}{% endif %}

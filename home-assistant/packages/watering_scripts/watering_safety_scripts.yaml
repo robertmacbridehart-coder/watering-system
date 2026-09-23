@@ -1,0 +1,593 @@
+# Phase 3.4: Emergency/Safety Scripts
+# File: home-assistant/packages/watering_scripts/watering_safety_scripts.yaml
+# Purpose: Emergency stop and graceful shutdown procedures
+# Last Updated: 2025-11-01
+# Revision: Fixed adversarial review issues
+#
+# Dependencies:
+# - input_select.watering_system_state (Phase 2.1 - system helpers) - REQUIRED
+# - script.log_system_event (logging_scripts.yaml) - persistent event logging - REQUIRED
+# - script.send_critical_notification (Phase 9 - notification system) - REQUIRED
+# - script.stop_main_pump (Phase 3.2 - pump scripts) - REQUIRED
+# - script.close_all_zones (Phase 3.1 - zone scripts) - REQUIRED
+# - script.stop_dosing_pumps (Phase 3.3 - fert scripts) - Optional, fails gracefully if not implemented
+# - script.open_pressure_relief (Phase 3.2 - pump scripts) - REQUIRED
+#
+# Logging:
+# - All events go through script.log_system_event: system_log (always) + a
+#   persistent system_events row via the watering_system_event bus event
+#   (see logging_scripts.yaml). Replaces the former input_text.cycle_event_log.
+
+script:
+  # Emergency stop - immediate shutdown of all watering operations
+  # Called by: Manual button, safety automations, zone watchdog, state machine
+  # Sends notification directly (last line of defense)
+  emergency_stop:
+    alias: "Emergency Stop"
+    description: "Immediate emergency shutdown with notification and verification"
+    icon: mdi:stop-circle
+    mode: restart
+    fields:
+      reason:
+        description: "Why emergency stop was triggered"
+        example: "Tank level critical"
+        default: "Manual emergency stop"
+    sequence:
+      # Log the emergency stop (system_log + persistent system_events row)
+      - service: script.log_system_event
+        data:
+          severity: critical
+          event_type: safety_estop
+          message: "Emergency stop triggered: {{ reason }}"
+          logger: watering_system.emergency_stop
+
+      # Turn off ALL relays in parallel (no delays - immediate shutdown)
+      - parallel:
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_1_main_pump
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_2_zone_1
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_3_zone_2
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_4_zone_3
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_5_zone_4
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_6_fert_bypass
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_7_fert_line
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_8
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_9_pressure_relief
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_10_24v_cabinet
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_11
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_12
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_13
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_14
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_15
+          - service: switch.turn_off
+            target:
+              entity_id: switch.watering_system_relay_16
+
+      # Wait for command cycle completion and stabilization
+      # 1.6s for 16 relays @ 100ms each + 2.4s stabilization = 4s total
+      - delay:
+          seconds: 4
+
+      # Verify all relays are off and collect failures (RETURNS LIST)
+      - variables:
+          failed_relays: >
+            {% set failures = [] %}
+            {% if states('switch.watering_system_relay_1_main_pump') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R1 (main pump)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_2_zone_1') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R2 (zone 1)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_3_zone_2') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R3 (zone 2)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_4_zone_3') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R4 (zone 3)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_5_zone_4') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R5 (zone 4)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_6_fert_bypass') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R6 (fert bypass)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_7_fert_line') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R7 (fert line)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_8') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R8'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_9_pressure_relief') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R9 (pressure relief)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_10_24v_cabinet') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R10 (24V cabinet)'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_11') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R11'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_12') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R12'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_13') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R13'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_14') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R14'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_15') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R15'] %}
+            {% endif %}
+            {% if states('switch.watering_system_relay_16') in ['on', 'unavailable', 'unknown'] %}
+              {% set failures = failures + ['R16'] %}
+            {% endif %}
+            {{ failures }}
+
+      # If any relays failed, attempt ONE repair cycle
+      - if:
+          - condition: template
+            value_template: "{{ failed_relays | length > 0 }}"
+        then:
+          # Log repair attempt
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: safety_relay_fault
+              message: "Emergency stop: {{ failed_relays | length }} relay{{ 's' if failed_relays | length != 1 else '' }} failed first check, attempting repair: {{ failed_relays | join(', ') }}"
+              logger: watering_system.emergency_stop
+
+          # Retry failed relays only (exact match on full relay string)
+          - parallel:
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R1 (main pump)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_1_main_pump
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R2 (zone 1)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_2_zone_1
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R3 (zone 2)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_3_zone_2
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R4 (zone 3)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_4_zone_3
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R5 (zone 4)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_5_zone_4
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R6 (fert bypass)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_6_fert_bypass
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R7 (fert line)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_7_fert_line
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R8' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_8
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R9 (pressure relief)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_9_pressure_relief
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R10 (24V cabinet)' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_10_24v_cabinet
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R11' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_11
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R12' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_12
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R13' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_13
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R14' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_14
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R15' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_15
+              - if:
+                  - condition: template
+                    value_template: "{{ 'R16' in failed_relays }}"
+                then:
+                  - service: switch.turn_off
+                    target:
+                      entity_id: switch.watering_system_relay_16
+
+          # Wait for repair commands to complete
+          - delay:
+              seconds: 4
+
+          # Second verification - check if repair worked
+          - variables:
+              final_failed_relays: >
+                {% set failures = [] %}
+                {% if 'R1 (main pump)' in failed_relays and states('switch.watering_system_relay_1_main_pump') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R1 (main pump)'] %}
+                {% endif %}
+                {% if 'R2 (zone 1)' in failed_relays and states('switch.watering_system_relay_2_zone_1') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R2 (zone 1)'] %}
+                {% endif %}
+                {% if 'R3 (zone 2)' in failed_relays and states('switch.watering_system_relay_3_zone_2') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R3 (zone 2)'] %}
+                {% endif %}
+                {% if 'R4 (zone 3)' in failed_relays and states('switch.watering_system_relay_4_zone_3') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R4 (zone 3)'] %}
+                {% endif %}
+                {% if 'R5 (zone 4)' in failed_relays and states('switch.watering_system_relay_5_zone_4') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R5 (zone 4)'] %}
+                {% endif %}
+                {% if 'R6 (fert bypass)' in failed_relays and states('switch.watering_system_relay_6_fert_bypass') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R6 (fert bypass)'] %}
+                {% endif %}
+                {% if 'R7 (fert line)' in failed_relays and states('switch.watering_system_relay_7_fert_line') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R7 (fert line)'] %}
+                {% endif %}
+                {% if 'R8' in failed_relays and states('switch.watering_system_relay_8') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R8'] %}
+                {% endif %}
+                {% if 'R9 (pressure relief)' in failed_relays and states('switch.watering_system_relay_9_pressure_relief') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R9 (pressure relief)'] %}
+                {% endif %}
+                {% if 'R10 (24V cabinet)' in failed_relays and states('switch.watering_system_relay_10_24v_cabinet') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R10 (24V cabinet)'] %}
+                {% endif %}
+                {% if 'R11' in failed_relays and states('switch.watering_system_relay_11') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R11'] %}
+                {% endif %}
+                {% if 'R12' in failed_relays and states('switch.watering_system_relay_12') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R12'] %}
+                {% endif %}
+                {% if 'R13' in failed_relays and states('switch.watering_system_relay_13') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R13'] %}
+                {% endif %}
+                {% if 'R14' in failed_relays and states('switch.watering_system_relay_14') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R14'] %}
+                {% endif %}
+                {% if 'R15' in failed_relays and states('switch.watering_system_relay_15') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R15'] %}
+                {% endif %}
+                {% if 'R16' in failed_relays and states('switch.watering_system_relay_16') in ['on', 'unavailable', 'unknown'] %}
+                  {% set failures = failures + ['R16'] %}
+                {% endif %}
+                {{ failures }}
+
+          # Log repair results (severity error if any relay still stuck, else info)
+          - service: script.log_system_event
+            data:
+              severity: "{{ 'error' if final_failed_relays | length > 0 else 'info' }}"
+              event_type: safety_relay_fault
+              message: >
+                Emergency stop repair complete.
+                {% if final_failed_relays | length > 0 %}
+                Still failed: {{ final_failed_relays | join(', ') }}
+                {% else %}
+                All relays now off.
+                {% endif %}
+              logger: watering_system.emergency_stop
+
+      # CRITICAL: Send notification BEFORE state change (last line of defense)
+      # Use continue_on_error to ensure state change happens even if notification fails
+      - alias: "Send critical notification"
+        continue_on_error: true
+        service: script.send_critical_notification
+        data:
+          message: >
+            Emergency Stop Activated
+            {{ reason }}
+            {% if failed_relays | length > 0 %}
+              {% if final_failed_relays is defined %}
+                {% if final_failed_relays | length > 0 %}
+            ⚠️ {{ final_failed_relays | length }} relay{{ 's' if final_failed_relays | length != 1 else '' }} could not be verified after repair: {{ final_failed_relays | join(', ') }}
+                {% else %}
+            ✓ All relays verified off after repair cycle
+                {% endif %}
+              {% else %}
+            ⚠️ {{ failed_relays | length }} relay{{ 's' if failed_relays | length != 1 else '' }} could not be verified: {{ failed_relays | join(', ') }}
+              {% endif %}
+            {% else %}
+            All systems shut down successfully.
+            {% endif %}
+            Manual intervention required.
+
+      # Log emergency stop completion
+      - service: script.log_system_event
+        data:
+          severity: critical
+          event_type: safety_estop
+          message: "Emergency stop sequence completed - entering error_e_stop state"
+          logger: watering_system.emergency_stop
+
+      # Set state to error_e_stop (prevents automatic restart).
+      # §1.2: do NOT overwrite the 'winterized' control state. That state is
+      # entered/left ONLY through watering_state_control_guard, and the
+      # de-winterization test (notification/tests.yaml) + seasonal export
+      # (watering_db/db_automations.yaml) trigger off LEAVING it. Clobbering it
+      # with error_e_stop would fire a spurious de-winterization test now and
+      # then silently SKIP the real one in spring (the control guard's exit
+      # branch only resets to idle if the state is still 'winterized'). Hardware
+      # is already safed above and the CRITICAL alert already went out, so
+      # preserving 'winterized' loses nothing. Every other state (including
+      # manual_override) still latches error_e_stop.
+      - if:
+          - condition: template
+            value_template: "{{ is_state('input_select.watering_system_state', 'winterized') }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: safety_estop
+              message: "Emergency stop while WINTERIZED - hardware safed and CRITICAL alert sent, but state left as 'winterized' (not overwritten to error_e_stop) to keep the de-winterization invariant. Verify hardware before spring de-winterization."
+              entity_id: input_select.watering_system_state
+              value_after: "winterized"
+              logger: watering_system.emergency_stop
+        else:
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: error_e_stop
+
+          # Verify state transition succeeded
+          - wait_template: "{{ is_state('input_select.watering_system_state', 'error_e_stop') }}"
+            timeout: 2
+
+          # Log state transition result
+          - if:
+              - condition: template
+                value_template: "{{ not is_state('input_select.watering_system_state', 'error_e_stop') }}"
+            then:
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: safety_state_fault
+                  message: "State transition to error_e_stop failed. Current state: {{ states('input_select.watering_system_state') }}. HARDWARE IS SAFE (all relays off)."
+                  entity_id: input_select.watering_system_state
+                  value_after: "{{ states('input_select.watering_system_state') }}"
+                  logger: watering_system.emergency_stop
+
+  # Safe shutdown - graceful shutdown with pressure relief cycle
+  # Called by: State machine (normal end-of-cycle), manual graceful stop
+  # Does NOT send notification (normal operation)
+  safe_shutdown:
+    alias: "Safe Shutdown"
+    description: "Graceful shutdown with proper pressure relief cycle"
+    icon: mdi:power
+    mode: restart
+    sequence:
+      # Log shutdown initiation (system_log + persistent system_events row)
+      - service: script.log_system_event
+        data:
+          severity: info
+          event_type: safety_shutdown
+          message: "Safe shutdown sequence started"
+          logger: watering_system.safe_shutdown
+
+      # Stop main pump (includes 3-second verification)
+      - alias: "Stop main pump"
+        continue_on_error: true
+        service: script.stop_main_pump
+
+      # Close all zone valves
+      - alias: "Close all zones"
+        continue_on_error: true
+        service: script.close_all_zones
+
+      # Stop dosing pumps. Phase 3.3 is not built yet, so this script may not
+      # exist. continue_on_error does NOT suppress a non-existent-service call
+      # (verified 2026-08-03: ServiceNotFound halts the whole sequence -- this
+      # was the actual cause of open follow-up 5, NOT stop_main_pump's error),
+      # so guard on the script entity existing and being usable. When 3.3 ships
+      # the guard passes automatically; continue_on_error still covers a real
+      # error raised by the script then.
+      - alias: "Stop dosing pumps (only if the script exists and is available)"
+        if:
+          - condition: template
+            value_template: >-
+              {{ states.script.stop_dosing_pumps is not none
+                 and states('script.stop_dosing_pumps')
+                     not in ['unavailable', 'unknown'] }}
+        then:
+          - alias: "Stop dosing pumps"
+            continue_on_error: true
+            service: script.stop_dosing_pumps
+
+      # Wait for water flow to stop (residual drain)
+      - delay:
+          seconds: 5
+
+      # Pressure relief cycle (opens relief, waits, closes with verification)
+      - alias: "Open pressure relief"
+        continue_on_error: true
+        service: script.open_pressure_relief
+
+      # Valve discipline: close BOTH fert-manifold selector valves (R6 bypass +
+      # R7 fert line) so any stop leaves every flow path shut - mirrors the
+      # state_post_cycle_relief cleanup. After the relief bleed, before cutting
+      # 24V cabinet power (R10) so the motorized valves still have 24V to travel.
+      - alias: "Close fert-manifold valves (R6 + R7)"
+        continue_on_error: true
+        service: switch.turn_off
+        target:
+          entity_id:
+            - switch.watering_system_relay_6_fert_bypass
+            - switch.watering_system_relay_7_fert_line
+
+      # Disable 24V cabinet (powers down Modbus relay board)
+      - service: switch.turn_off
+        target:
+          entity_id: switch.watering_system_relay_10_24v_cabinet
+
+      # Verify 24V cabinet is off (3 second timeout for Modbus response)
+      - wait_template: "{{ is_state('switch.watering_system_relay_10_24v_cabinet', 'off') }}"
+        timeout: 3
+
+      # Log warning if 24V cabinet failed to turn off
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('switch.watering_system_relay_10_24v_cabinet', 'off') }}"
+        then:
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: safety_shutdown
+              message: "24V cabinet failed to turn off during safe shutdown. Current state: {{ states('switch.watering_system_relay_10_24v_cabinet') }}"
+              entity_id: switch.watering_system_relay_10_24v_cabinet
+              value_after: "{{ states('switch.watering_system_relay_10_24v_cabinet') }}"
+              logger: watering_system.safe_shutdown
+
+      # ===== FINAL STATE =====
+      # Only return to idle if the shutdown did NOT enter an error_ state
+      # mid-sequence (e.g. the stop_main_pump comms-lost fail-fast set
+      # error_comms_lost, or open_pressure_relief aborted). Forcing idle would
+      # mask the error and, for error_comms_lost specifically, prevent the Part B
+      # recovery automation (keyed off error_comms_lost) from ever firing.
+      # Hardware is already safed on both paths.
+      - variables:
+          ended_in_error: "{{ states('input_select.watering_system_state').startswith('error_') }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ ended_in_error }}"
+        then:
+          # Preserve the error state; do NOT clear to idle.
+          - service: script.log_system_event
+            data:
+              severity: warning
+              event_type: safety_shutdown
+              message: >-
+                Safe shutdown completed with all hardware safed, but the system
+                entered {{ states('input_select.watering_system_state') }} during
+                the sequence. NOT clearing to idle; leaving the error for recovery
+                / human review.
+              entity_id: input_select.watering_system_state
+              value_after: "{{ states('input_select.watering_system_state') }}"
+              logger: watering_system.safe_shutdown
+
+        else:
+          # Normal path: return to idle (ready state)
+          - service: input_select.select_option
+            target:
+              entity_id: input_select.watering_system_state
+            data:
+              option: idle
+
+          # Verify state transition succeeded
+          - wait_template: "{{ is_state('input_select.watering_system_state', 'idle') }}"
+            timeout: 2
+
+          # Log state transition result
+          - if:
+              - condition: template
+                value_template: "{{ not is_state('input_select.watering_system_state', 'idle') }}"
+            then:
+              - service: script.log_system_event
+                data:
+                  severity: error
+                  event_type: safety_state_fault
+                  message: "State transition to idle failed. Current state: {{ states('input_select.watering_system_state') }}"
+                  entity_id: input_select.watering_system_state
+                  value_after: "{{ states('input_select.watering_system_state') }}"
+                  logger: watering_system.safe_shutdown
+            else:
+              - service: script.log_system_event
+                data:
+                  severity: info
+                  event_type: safety_shutdown
+                  message: "State transition to idle completed successfully"
+                  logger: watering_system.safe_shutdown
+
+      # Log completion (system_log + persistent system_events row)
+      - service: script.log_system_event
+        data:
+          severity: info
+          event_type: safety_shutdown
+          message: >-
+            Safe shutdown sequence completed (final state:
+            {{ states('input_select.watering_system_state') }})
+          logger: watering_system.safe_shutdown

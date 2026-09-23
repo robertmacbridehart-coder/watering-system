@@ -1,0 +1,338 @@
+# ============================================================================
+# Decision routine  (ADR-021 as amended by Amendment A §3.2 + ADR-018 recording)
+# ----------------------------------------------------------------------------
+# script.compute_zone_programs -- the ONE side-effect-free routine that resolves
+# each zone's FINAL program (off/light/normal/heavy/booster): the WEATHER-PRIMARY
+# tree, then the soil-moisture GUARD, wrapped by the UNCHANGED ADR-020
+# cadence/booster layer. Returns the full ADR-018 Event-6 decision payload via
+# response_variable.
+#
+# Intensity order (ADR-021 Amendment A, architecture §3.2):
+#   1. weather tree        (primary: current-rain skip, rain_72h/24h gates,
+#                           window-aware de-lagged forecast high)
+#   2. dry bump            (+1 step if the zone's dry-bump is enabled AND
+#                           binary_sensor.zone_N_moisture_dry is on; cap heavy)
+#   3. forecast downgrade  (POP > 80 AND >= 5 mm: heavy->light, normal->off,
+#                           light->off)
+#   4. WET VETO            (binary_sensor.zone_N_moisture_wet on -> off; final, hard)
+# The guard sensors (moisture_guard.yaml) own the thresholds + hysteresis and read
+# OFF when moisture is unknown/stale or the threshold is 0 (= disabled), so a dead
+# probe or an unset helper can only ever leave the weather decision untouched.
+#
+# "Option A" single source of truth: consumed by BOTH
+#   * the always-on weather logger automation (§3.6 S3) -> records every window
+#     (run/skip/parked), even while parked in manual_override; and
+#   * state_window_check (§3.6 S4) -> applies the programs (zone_N_program) for
+#     the active window; fails safe to all-off -> idle if this routine errors or
+#     returns a malformed result.
+#
+# SIDE-EFFECT-FREE: reads states/attributes/helpers and calls the pure
+# script.resolve_program_multiplier only; it writes no entity and actuates
+# nothing, so it is safe to exist (and be called for recording) while parked.
+#
+# Multiplier: NOT re-derived here -- delegated to script.resolve_program_multiplier
+# (the single source factored out of calculate_zone_runtime) so the recorded
+# program_multiplier is EXACTLY the value the runtime path will use.
+#
+# Inputs consumed:
+#   rain       : binary_sensor.rain_active, sensor.rain_24h, sensor.rain_72h
+#   forecast   : sensor.forecast_pop_today, sensor.forecast_rain_today
+#   temp       : sensor.forecast_temp_high_{today,tomorrow} (de-lagged, WINDOW-aware:
+#                morning->today, evening->tomorrow; NOT the 04:00-rollover card sensor)
+#   weather thr: input_number.zone_N_<season>_{rain_off,rain_light,rain_min}_mm,
+#                input_number.zone_N_<season>_{temp_heavy,temp_normal}_c
+#   guard      : binary_sensor.zone_N_moisture_{wet,dry},
+#                input_boolean.zone_N_moisture_dry_bump_enabled (+ the thresholds and
+#                hysteresis, recorded for replay); sensor.zone_N_soil_moisture
+#   cadence    : ADR-020 enable / interval / last-water / booster (sole copy since S4)
+#
+# RECORDED for offline replay: every input above lands in decision_criteria, so a
+# moisture-led policy can be re-evaluated from the DB against any threshold set
+# before moisture is given more authority (Amendment A Decision 5).
+#
+# NOT YET: hysteresis on the RAIN gates (Amendment A Decision 6; band needs S3
+# data).
+# ============================================================================
+
+script:
+  compute_zone_programs:
+    alias: "Compute Zone Programs (weather-primary + moisture guard, side-effect-free)"
+    icon: mdi:brain
+    # Read-only; called at most a couple of times per window (logger + window_check).
+    # Queued keeps at most one evaluation in flight, so the nested multiplier calls
+    # never fan out.
+    mode: queued
+    max: 5
+    fields:
+      window:
+        description: "Window being decided (morning or evening): drives the booster slot and the forecast-temperature horizon"
+        example: "evening"
+        required: true
+    sequence:
+      - condition: template
+        value_template: "{{ window in ['morning', 'evening'] }}"
+
+      # ---- 1. Global inputs (read ONCE; the recorded snapshot == what was decided on) ----
+      - variables:
+          # UTC, as weather_schema.sql / architecture §13.3.1 specify, and consistent with
+          # watering_ops (cross-DB joins on time). now() gave a local +02:00 offset
+          # (fixed 2026-09-23; snapshot_id 1 predates the fix).
+          observed_at: "{{ utcnow().isoformat() }}"
+          # Rain, via the ecowitt.yaml source-selected abstraction (WH40-or-DWD).
+          rain_now: "{{ is_state('binary_sensor.rain_active', 'on') }}"
+          rain_24h_raw: "{{ states('sensor.rain_24h') }}"
+          rain_72h_raw: "{{ states('sensor.rain_72h') }}"
+          rain_24h: "{{ rain_24h_raw | float(0) }}"
+          rain_72h: "{{ rain_72h_raw | float(0) }}"
+          rain_source: >-
+            {{ 'wh40' if is_state('binary_sensor.wh40_available_24h', 'on') else 'dwd' }}
+          # De-lagged temperature, WINDOW-AWARE (ADR-021 fixes root cause a):
+          # the morning decision reads TODAY's forecast high; the evening decision
+          # reads TOMORROW's (an evening watering runs into the next day). Both from
+          # the single widened forecast fetch (dwd_brightsky.yaml). Replaces the old
+          # 04:00-rollover sensor (kept for the dashboard card only). Unknown ->
+          # neutral (never forces heavy).
+          temp_high_horizon: "{{ 'today' if window == 'morning' else 'tomorrow' }}"
+          temp_high_raw: "{{ states('sensor.forecast_temp_high_' ~ temp_high_horizon) }}"
+          temp_high_avail: "{{ is_number(temp_high_raw) }}"
+          temp_high: "{{ temp_high_raw | float(0) }}"
+          # Forecast-rain downgrade inputs (dedicated rest-of-today fetch).
+          pop_today: "{{ states('sensor.forecast_pop_today') | float(0) }}"
+          rain_today: "{{ states('sensor.forecast_rain_today') | float(0) }}"
+          # Weather is "available" when the accumulations we key on are numbers
+          # (temp is handled gracefully via temp_high_avail; ADR-021 demotes the
+          # 3-day average out of the availability test -- partially supersedes ADR-004).
+          weather_available: "{{ is_number(rain_24h_raw) and is_number(rain_72h_raw) }}"
+          # Moisture-guard hysteresis (recorded only; the guard sensors apply it).
+          moisture_hysteresis: "{{ states('input_number.moisture_guard_hysteresis') | float(0) }}"
+          # Cadence globals (ADR-020).
+          morning_en: "{{ is_state('input_boolean.enable_morning_window', 'on') }}"
+          evening_en: "{{ is_state('input_boolean.enable_evening_window', 'on') }}"
+          # The window being decided is the `window` FIELD, NOT
+          # input_select.active_watering_window. The scheduler only sets that
+          # helper when it starts a cycle, so while parked/winterized (S3 recording)
+          # it is stale and the booster slot would be judged against the wrong
+          # window (found 2026-09-23). state_window_check (S4) passes the active
+          # window here, so the two agree.
+          active_window: "{{ window }}"
+          single_window: >-
+            {{ (morning_en and not evening_en) or (evening_en and not morning_en) }}
+          # Context flags, recorded per zone so an always-on row is interpretable
+          # (would_water is the DECISION; these say whether it could have been
+          # applied). They do not affect the decision.
+          window_enabled: "{{ morning_en if window == 'morning' else evening_en }}"
+          manual_override: "{{ is_state('input_boolean.manual_override_active', 'on') }}"
+          winterized: "{{ is_state('input_boolean.system_winterized', 'on') }}"
+
+      # ---- 2. Per-zone decision: weather tree + moisture guard + UNCHANGED cadence ----
+      # Produces `zbase`, a list of per-zone dicts carrying everything EXCEPT the
+      # multiplier (resolved in step 3 from the single source). Native-template
+      # list build (HA parses the rendered list back to a native list).
+      - variables:
+          zbase: >-
+            {% set step_up = {'light': 'normal', 'normal': 'heavy', 'heavy': 'heavy'} %}
+            {% set ns = namespace(z=[]) %}
+            {% for z in [1, 2, 3, 4] %}
+              {% set season = states('input_select.zone_' ~ z ~ '_season') %}
+              {# ---- weather thresholds (safe defaults never produce a spurious heavy) ---- #}
+              {% set roff = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_off_mm') | float(999) %}
+              {% set rlight = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_light_mm') | float(999) %}
+              {% set rmin = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_rain_min_mm') | float(0) %}
+              {% set theavy = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_temp_heavy_c') | float(999) %}
+              {% set tnormal = states('input_number.zone_' ~ z ~ '_' ~ season ~ '_temp_normal_c') | float(0) %}
+              {# ---- moisture (recorded) + guard state (moisture_guard.yaml) ---- #}
+              {% set m_raw = states('sensor.zone_' ~ z ~ '_soil_moisture') %}
+              {% set m_cnt = state_attr('sensor.zone_' ~ z ~ '_soil_moisture', 'contributing_sensors') | int(0) %}
+              {% set moisture = (m_raw | float) if (is_number(m_raw) and m_cnt > 0) else none %}
+              {% set wet = is_state('binary_sensor.zone_' ~ z ~ '_moisture_wet', 'on') %}
+              {% set dry = is_state('binary_sensor.zone_' ~ z ~ '_moisture_dry', 'on') %}
+              {% set dry_en = is_state('input_boolean.zone_' ~ z ~ '_moisture_dry_bump_enabled', 'on') %}
+              {% set veto_thr = states('input_number.zone_' ~ z ~ '_moisture_wet_veto') | float(0) %}
+              {% set dry_thr = states('input_number.zone_' ~ z ~ '_moisture_dry_bump') | float(0) %}
+              {% set s = namespace(wp='normal', branch='', skip='', mods=[]) %}
+              {# ================= 1. WEATHER TREE (primary) ================= #}
+              {% if not weather_available %}
+                {% set s.wp = 'normal' %}
+                {% set s.branch = 'weather_unavailable' %}
+              {% elif rain_now %}
+                {% set s.wp = 'off' %}
+                {% set s.branch = 'raining' %}
+                {% set s.skip = 'raining' %}
+              {% elif rain_72h > roff %}
+                {% set s.wp = 'off' %}
+                {% set s.branch = 'rain_72h_off' %}
+                {% set s.skip = 'rain_72h_gt_off' %}
+              {% elif rain_24h > rlight %}
+                {% set s.wp = 'light' %}
+                {% set s.branch = 'recent_rain' %}
+              {% elif not temp_high_avail %}
+                {% set s.wp = 'normal' %}
+                {% set s.branch = 'no_temp' %}
+              {% elif temp_high >= theavy and rain_72h < rmin %}
+                {% set s.wp = 'heavy' %}
+                {% set s.branch = 'hot_dry' %}
+              {% elif temp_high >= tnormal %}
+                {% set s.wp = 'normal' %}
+                {% set s.branch = 'warm' %}
+              {% else %}
+                {% set s.wp = 'light' %}
+                {% set s.branch = 'cool' %}
+              {% endif %}
+              {% set wp_weather = s.wp %}
+              {# ================= 2. DRY BUMP (optional; +1, capped at heavy) ================= #}
+              {% if dry_en and dry and s.wp != 'off' %}
+                {% set s.wp = step_up[s.wp] %}
+                {% set s.mods = s.mods + ['dry_bump'] %}
+              {% endif %}
+              {# ================= 3. FORECAST-RAIN DOWNGRADE (capped 2, floored) ================= #}
+              {% if s.wp != 'off' and pop_today > 80 and rain_today >= 5 %}
+                {% set s.wp = 'light' if s.wp == 'heavy' else 'off' %}
+                {% set s.mods = s.mods + ['forecast_downgrade'] %}
+                {% if s.wp == 'off' %}
+                  {% set s.skip = 'forecast_downgrade' %}
+                {% endif %}
+              {% endif %}
+              {# ================= 4. WET VETO (final, hard) ================= #}
+              {% if wet and s.wp != 'off' %}
+                {% set s.wp = 'off' %}
+                {% set s.mods = s.mods + ['wet_veto'] %}
+                {% set s.skip = 'moisture_wet' %}
+              {% endif %}
+              {% set wp = s.wp %}
+              {# ================= cadence layer (ADR-020; the ONLY copy since §3.6 S4) ================= #}
+              {% set enabled = is_state('input_boolean.zone_' ~ z ~ '_enabled', 'on') %}
+              {% set n = states('input_number.zone_' ~ z ~ '_watering_interval_days') | int(3) %}
+              {% set last = states('sensor.zone_' ~ z ~ '_watering') %}
+              {% set has_last = last not in ['unknown', 'unavailable', 'none', ''] %}
+              {% set days_since = ((now() - as_datetime(last)).total_seconds() / 86400) if has_last else 9999 %}
+              {% set due = days_since >= n %}
+              {% set mid = n / 2 %}
+              {% set target = 'evening' if evening_en else 'morning' %}
+              {% set last_booster = states('sensor.zone_' ~ z ~ '_last_booster') %}
+              {% set has_booster = last_booster not in ['unknown', 'unavailable', 'none', ''] %}
+              {% set booster_pending = (not has_booster) or (has_last and as_datetime(last_booster) < as_datetime(last)) %}
+              {% set in_band = has_last and days_since >= mid and days_since < n %}
+              {% set booster_slot = in_band and active_window == target and booster_pending and not (single_window and n == 1) %}
+              {% if not enabled %}
+                {% set p = 'off' %}
+              {% elif wp == 'off' %}
+                {% set p = 'off' %}
+              {% elif due %}
+                {% set p = wp %}
+              {% elif booster_slot and wp == 'heavy' %}
+                {% set p = 'booster' %}
+              {% else %}
+                {% set p = 'off' %}
+              {% endif %}
+              {# ================= decision_criteria (tuning-feedback / replay payload) ================= #}
+              {% set crit = {
+                   'branch': s.branch,
+                   'skip_reason': (s.skip if s.skip != '' else none),
+                   'modifiers': s.mods,
+                   'wp_weather': wp_weather,
+                   'wp_before_cadence': wp,
+                   'enabled': enabled,
+                   'due': due,
+                   'days_since': (days_since | round(2)),
+                   'interval_days': n,
+                   'booster_slot': booster_slot,
+                   'moisture_pct': moisture,
+                   'moisture_sensor_count': m_cnt,
+                   'guard': {
+                     'wet': wet,
+                     'dry': dry,
+                     'dry_bump_enabled': dry_en,
+                     'wet_veto': veto_thr,
+                     'dry_bump': dry_thr,
+                     'hysteresis': moisture_hysteresis },
+                   'weather_thresholds': {
+                     'rain_off': roff, 'rain_light': rlight, 'rain_min': rmin,
+                     'temp_heavy': theavy, 'temp_normal': tnormal },
+                   'rain_now': rain_now,
+                   'rain_24h_mm': rain_24h,
+                   'rain_72h_mm': rain_72h,
+                   'rain_source': rain_source,
+                   'temp_high_c': (temp_high if temp_high_avail else none),
+                   'temp_high_horizon': temp_high_horizon,
+                   'forecast_pop': pop_today,
+                   'forecast_rain_mm': rain_today,
+                   'weather_available': weather_available,
+                   'window_enabled': window_enabled,
+                   'manual_override': manual_override,
+                   'winterized': winterized } %}
+              {% set ns.z = ns.z + [{
+                   'zone_id': z,
+                   'season': season,
+                   'program': p,
+                   'would_water': (p != 'off'),
+                   'moisture_pct': moisture,
+                   'moisture_sensor_count': m_cnt,
+                   'interval': n,
+                   'criteria': crit }] %}
+            {% endfor %}
+            {{ ns.z }}
+
+      # ---- 3. Multiplier from the SINGLE source (one call per zone) ----
+      - service: script.resolve_program_multiplier
+        data:
+          program: "{{ zbase[0].program }}"
+          single_window: "{{ single_window }}"
+          interval_days: "{{ zbase[0].interval }}"
+        response_variable: mult_1
+      - service: script.resolve_program_multiplier
+        data:
+          program: "{{ zbase[1].program }}"
+          single_window: "{{ single_window }}"
+          interval_days: "{{ zbase[1].interval }}"
+        response_variable: mult_2
+      - service: script.resolve_program_multiplier
+        data:
+          program: "{{ zbase[2].program }}"
+          single_window: "{{ single_window }}"
+          interval_days: "{{ zbase[2].interval }}"
+        response_variable: mult_3
+      - service: script.resolve_program_multiplier
+        data:
+          program: "{{ zbase[3].program }}"
+          single_window: "{{ single_window }}"
+          interval_days: "{{ zbase[3].interval }}"
+        response_variable: mult_4
+
+      # ---- 4. Assemble the Event-6 payload ----
+      - variables:
+          zones: >-
+            {% set m = [mult_1.multiplier, mult_2.multiplier, mult_3.multiplier, mult_4.multiplier] %}
+            {% set ns = namespace(z=[]) %}
+            {% for zb in zbase %}
+              {% set i = loop.index0 %}
+              {% set ns.z = ns.z + [{
+                   'zone_id': zb.zone_id,
+                   'season': zb.season,
+                   'computed_program': zb.program,
+                   'program_multiplier': (m[i] | float),
+                   'would_water': (1 if zb.would_water else 0),
+                   'moisture_pct': zb.moisture_pct,
+                   'moisture_sensor_count': zb.moisture_sensor_count,
+                   'decision_criteria': zb.criteria }] %}
+            {% endfor %}
+            {{ ns.z }}
+      # Shape = the weather_logger Event-6 contract EXACTLY (architecture.md
+      # §13.3.1 / weather_schema.sql): snapshot columns FLAT at top level (the
+      # logger reads data.get(<col>), not data.snapshot.<col>) and the per-zone
+      # list keyed `zone_decisions` (NOT `zones`). S3 fires this dict as-is.
+      - variables:
+          result:
+            observed_at: "{{ observed_at }}"
+            window_name: "{{ window }}"
+            weather_available: "{{ weather_available }}"
+            raining_now: "{{ rain_now }}"
+            rain_source: "{{ rain_source }}"
+            temp_high_forecast_c: "{{ temp_high if temp_high_avail else none }}"
+            rain_24h_mm: "{{ rain_24h }}"
+            rain_72h_mm: "{{ rain_72h }}"
+            forecast_pop_today: "{{ pop_today }}"
+            forecast_rain_today_mm: "{{ rain_today }}"
+            zone_decisions: "{{ zones }}"
+
+      - stop: "Zone programs computed"
+        response_variable: result

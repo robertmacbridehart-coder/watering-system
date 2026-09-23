@@ -1,0 +1,32 @@
+---
+# Watering operational-database HA integration.
+#
+# HA-side counterpart to the AppDaemon watering_db app
+# (home-assistant/appdaemon/watering_db/). This package holds the HA YAML that
+# bridges to that app; the AppDaemon code itself lives outside packages/ because
+# it must not be parsed by HA's !include_dir_named.
+#
+# Home for all watering_db HA automations. Currently: the seasonal CSV export
+# trigger - when the system is winterized, fire the export event that the
+# AppDaemon db_export app consumes. See architecture.md Section 13.5.
+
+automation:
+  - id: watering_db_seasonal_export_on_winterize
+    alias: "Watering DB - Seasonal Export on Winterization"
+    description: >-
+      When the system enters the winterized STATE, fire the seasonal CSV export
+      event consumed by the AppDaemon db_export app. The export app defaults to
+      the current UTC year; no event_data is needed.
+
+      Triggered off input_select.watering_system_state -> winterized (NOT the
+      system_winterized boolean) per ADR-015 D-F: the winterized state is entered
+      only after the Phase 4 winterized guard passes, so a REJECTED winterization
+      (guard reverts the boolean while a cycle runs) does not fire a spurious
+      export. The guard lives in watering_state/state_machine.yaml.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_select.watering_system_state
+        to: winterized
+    action:
+      - event: watering_seasonal_export

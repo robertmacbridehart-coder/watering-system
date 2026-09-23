@@ -1,0 +1,41 @@
+---
+# AppDaemon app configuration for the watering_weather database (ADR-018).
+#
+# Repo source: home-assistant/appdaemon/watering_weather/ (this file +
+# weather_db_schema_init.py). Kept OUT of home-assistant/packages/ on purpose --
+# packages/ is loaded by HA's `!include_dir_named`, which would try to parse this
+# AppDaemon config as an HA package and fail config validation.
+#
+# Deploy target: this file + weather_db_schema_init.py + weather_schema.sql must
+# live under the AppDaemon app_dir on the HA Green. With app_dir set to
+# /homeassistant/appdaemon/apps (see docs/db_setup_guide.md), the deployed layout
+# is:
+#   /homeassistant/appdaemon/apps/watering_weather/apps.yaml
+#   /homeassistant/appdaemon/apps/watering_weather/weather_db_schema_init.py
+#   /homeassistant/appdaemon/apps/watering_weather/weather_schema.sql  (copy of docs/weather_schema.sql)
+#
+# The app .py + this apps.yaml deploy via the generic appdaemon loop in
+# home-assistant/scripts/pull_public_repo.sh; weather_schema.sql is copied there
+# from the canonical docs/weather_schema.sql (same anti-drift pattern as
+# watering_db) by a dedicated block in that script.
+#
+# App keys / module / class names are DISTINCT from the watering_db app so the
+# two never collide in AppDaemon's global namespace.
+#
+# The seasonal/winter export app lands in a later ADR-018 build phase.
+
+weather_db_schema_init:
+  module: weather_db_schema_init
+  class: WeatherDbSchemaInit
+  db_path: /homeassistant/watering_weather.db
+  schema_path: /homeassistant/appdaemon/apps/watering_weather/weather_schema.sql
+
+# Weather-snapshot sink (Event 6 of the payload contract, architecture.md §13.3.1).
+# Dumb consumer of the `watering_weather_snapshot` event fired by the always-on HA
+# snapshot automation: writes one weather_snapshots row + N zone_decisions children
+# per window, in one atomic transaction. All decision logic stays in HA.
+weather_logger:
+  module: weather_logger
+  class: WeatherLogger
+  db_path: /homeassistant/watering_weather.db
+  trigger_event: watering_weather_snapshot

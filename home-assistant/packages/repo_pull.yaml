@@ -1,0 +1,94 @@
+# Repo Pull Package
+#
+# Everything for the public-repo pull in ONE HA package (key "repo_pull"):
+#   - version sensors (read /config/version.json, written by pull_public_repo.sh)
+#   - the dashboard button (input_button.repo_pull) + the automation that turns a
+#     press into the `watering_repo_pull` bus event.
+#
+# The actual guarded pull (interlock -> backup -> pull -> validate -> restart) is
+# handled by the AppDaemon app in home-assistant/appdaemon/repo_pull/ (ADR-012),
+# which runs pull_public_repo.sh via subprocess -- NOT the HAOS shell_command
+# integration (unreliable; see docs/repo_pull_incident_report.md). Manual SSH pull
+# (/bin/sh /config/scripts/pull_public_repo.sh) remains a fallback.
+#
+# NOTE: with `packages: !include_dir_named packages`, the package key is the file
+# BASENAME and must be globally UNIQUE across the whole packages/ tree. Do NOT also
+# create packages/repo_pull/repo_pull.yaml -- the duplicate basename resolves to the
+# same key and silently drops one file's entities (this once broke these sensors).
+
+command_line:
+  - sensor:
+      name: "Repo Pull"
+      command: "cat /config/version.json 2>/dev/null || echo {}"
+      command_timeout: 30
+      scan_interval: 300
+      # State = the PRIVATE repo's version number, which the mirror workflow
+      # stamps into version_source.json (`git describe --tags --always`, e.g.
+      # "v0.2.1-10-ge10fc6e") and the pull writes into version.json as `tag`. It
+      # already encodes the last tag + commits-since + short SHA, so it advances
+      # on every pull with no manual release-cutting. Falls back to the short SHA
+      # if `tag` is missing (pre-stamp publish / API fallback), then 'unknown' if
+      # version.json is empty. (Single {{ }} expression - no {% set %} lines - so
+      # no folded whitespace leaks into the command_line sensor state.)
+      value_template: >-
+        {{ value_json.tag
+           if (value_json.tag | default('', true)) not in ['', 'unknown']
+           else ((value_json.sha | default('', true))[:7]
+                 if (value_json.sha | default('', true)) not in ['', 'unknown']
+                 else 'unknown') }}
+      json_attributes:
+        - repo
+        - branch
+        - tag
+        - sha
+        - pulled_at
+      unique_id: repo_pull_sha
+
+template:
+  # Plain (non-trigger) template sensors: they re-render whenever sensor.repo_pull
+  # changes -- including attribute-only changes like pulled_at -- AND re-evaluate
+  # on every HA startup. The previous "Repo Pull Time" was trigger-based and lost
+  # its update across the HA restart that each pull performs (it restored its old
+  # value and missed sensor.repo_pull re-populating during startup), so Last Pulled
+  # got stuck. A plain template reads the current pulled_at every time, regardless
+  # of whether the tag changed.
+  - sensor:
+      - name: "Repo Pull Time"
+        unique_id: repo_pull_time
+        device_class: timestamp
+        icon: mdi:clock-check
+        availability: >
+          {{ state_attr('sensor.repo_pull', 'pulled_at') not in [none, 'unknown', 'unavailable'] }}
+        state: "{{ state_attr('sensor.repo_pull', 'pulled_at') }}"
+
+      - name: "Repo Pull Short SHA"
+        unique_id: repo_pull_short_sha
+        icon: mdi:source-commit
+        state: >
+          {% set sha = state_attr('sensor.repo_pull', 'sha') %}
+          {% if sha and sha not in ['unknown', 'unavailable', none] and sha | length >= 7 %}
+            {{ sha[:7] }}
+          {% else %}
+            unknown
+          {% endif %}
+
+input_button:
+  repo_pull:
+    name: Pull Public Repo
+    icon: mdi:source-branch-sync
+
+automation:
+  - id: repo_pull_on_button_press
+    alias: "Repo Pull - Fire Pull Event on Button Press"
+    description: >-
+      When input_button.repo_pull is pressed, fire the `watering_repo_pull`
+      event consumed by the AppDaemon repo_pull app, which runs the guarded
+      pipeline (preflight interlock -> partial backup -> pull -> validate ->
+      restart). Mirrors the winterize -> seasonal-export pattern in
+      home-assistant/packages/watering_db/db_automations.yaml.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: input_button.repo_pull
+    action:
+      - event: watering_repo_pull

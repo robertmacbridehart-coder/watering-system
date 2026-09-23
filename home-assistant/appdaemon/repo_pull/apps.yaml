@@ -1,0 +1,77 @@
+---
+# AppDaemon app configuration for the guarded public-repo pull.
+#
+# Repo source: home-assistant/appdaemon/repo_pull/ (this file + repo_pull.py).
+# Kept in its own root (NOT under watering_db, NOT under home-assistant/packages/):
+# packages/ is loaded by HA's `!include_dir_named` and would try to parse this
+# AppDaemon config as an HA package and fail validation.
+#
+# Deploy target (see docs/db_setup_guide.md; app_dir = /homeassistant/appdaemon/apps):
+#   /homeassistant/appdaemon/apps/repo_pull/apps.yaml
+#   /homeassistant/appdaemon/apps/repo_pull/repo_pull.py
+# Deployed by home-assistant/scripts/pull_public_repo.sh, which now copies every
+# home-assistant/appdaemon/<app>/ folder (so this app self-updates on each pull).
+#
+# Trigger: the HA automation in home-assistant/packages/repo_pull.yaml
+# fires the `watering_repo_pull` event when input_button.repo_pull is pressed.
+
+repo_pull:
+  module: repo_pull
+  class: RepoPull
+
+  trigger_event: watering_repo_pull
+  pull_script: /homeassistant/scripts/pull_public_repo.sh
+  version_json: /homeassistant/version.json
+  db_path: /homeassistant/watering_ops.db
+
+  # Preflight interlock (fail-closed). A pull is blocked if ANY relay is ON or
+  # the state machine is in an active (actuating / mid-cycle) state. The relay-ON
+  # check is the load-bearing, hardware-ground-truth guard.
+  # Relay list == the actuating relays from docs/entity_reference.md (pump, the
+  # four zone valves, both fert valves, and the pressure-relief valve).
+  relay_entities:
+    - switch.watering_system_relay_1_main_pump
+    - switch.watering_system_relay_2_zone_1
+    - switch.watering_system_relay_3_zone_2
+    - switch.watering_system_relay_4_zone_3
+    - switch.watering_system_relay_5_zone_4
+    - switch.watering_system_relay_6_fert_bypass
+    - switch.watering_system_relay_7_fert_line
+    - switch.watering_system_relay_9_pressure_relief
+
+  state_entity: input_select.watering_system_state
+  # Active (actuating / mid-cycle) states of the Phase 4 state machine. Idle, the
+  # PARKED control states (manual_override, winterized), and the error-idle states
+  # are intentionally NOT listed -- relays are de-energized in all of them, and
+  # deploying a fix while parked or in an error state must remain possible.
+  # manual_override in particular is the end-of-testing park SOP, so a pull must
+  # NOT require un-parking (the boolean/state both RestoreEntity, so the park is
+  # preserved across the pull's auto-restart). The relay-ON check above is the
+  # actual actuation guard: if manual toggling has energized any relay, the pull
+  # still blocks on that, not on the park state.
+  active_states:
+    - window_check
+    - preflight_check
+    - watering_plain
+    - fert_prep
+    - fert_dose_phase1
+    - fert_dose_phase2
+    - post_cycle_relief
+
+  # NOTE: manual_override is deliberately NOT a blocker (see active_states above).
+  # The former `manual_override_entity` interlock was removed 2026-08-18 so a
+  # pull can run while parked in manual_override; the relay-ON check remains the
+  # load-bearing guard.
+
+  # Pre-pull partial backup (HA config only). backup_timeout must be generous:
+  # the call is awaited (blocks until the backup job finishes), and AppDaemon's
+  # default hass_timeout (~10 s) gives up mid-job.
+  backup_name_prefix: pre_repo_pull
+  backup_timeout: 300
+
+  # Restart HA automatically after a positively-validated pull. Set false to
+  # pull + validate only and restart by hand.
+  auto_restart: true
+
+  # Hard cap on the pull subprocess (and on waiting for the backup to finish).
+  subprocess_timeout: 300

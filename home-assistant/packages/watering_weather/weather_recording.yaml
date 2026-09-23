@@ -1,0 +1,105 @@
+# ============================================================================
+# Always-on weather + decision RECORDER  (ADR-018 §3.6 S3; ADR-021 Amendment A)
+# ----------------------------------------------------------------------------
+# At every morning/evening window start, in EVERY system state, call the shared
+# side-effect-free decision routine and fire Event 6 `watering_weather_snapshot`.
+# The AppDaemon sink (appdaemon/watering_weather/weather_logger.py) writes one
+# weather_snapshots row + four zone_decisions rows to watering_weather.db.
+#
+# NO CONDITIONS, deliberately (ADR-018 "always-on"): the recorder fires whether
+# the system is idle, mid-cycle, PARKED (manual_override), winterized, or the
+# window is disabled. That is how skip/parked days get captured, which zone_runs
+# never sees. `would_water` in each row is the DECISION; the per-zone
+# decision_criteria also carries window_enabled / manual_override / winterized,
+# which say whether that decision could have been applied.
+#
+# NOTHING HERE ACTUATES. compute_zone_programs reads only; firing an event is
+# reporting. The scheduler / state machine is untouched (S4 is separate).
+#
+# Payload = the weather_logger Event-6 contract (architecture.md §13.3.1,
+# docs/weather_schema.sql):
+#   * decision fields come straight from compute_zone_programs' response
+#     (flat snapshot columns + zone_decisions[]);
+#   * observational weather columns the decision doesn't use (current temp,
+#     humidity, pressure, cloud, yesterday's high, 3-day avg high) are added
+#     here, so the DB is also a plain twice-daily weather series;
+#   * `raw` (JSON catch-all) carries the per-probe soil readings + liveness, dew
+#     point and wind AS REPORTED. The wind unit is suspect: the sensor is
+#     labelled m/s but its BrightSky request uses the default (dwd) units, which
+#     I believe give km/h. So it is NOT written to wind_speed_ms until verified
+#     (START_HERE follow-up).
+# Unknown/unavailable values arrive as strings; the logger coerces them to NULL.
+#
+# Manual test: Settings -> Automations -> this automation -> "Run actions".
+# With no trigger id it records the window matching the time of day
+# (before noon = morning).
+# ============================================================================
+
+automation:
+  - id: watering_weather_snapshot_recorder
+    alias: "Watering Weather - Snapshot Recorder (always-on)"
+    description: >-
+      Records the weather + the per-zone decision at every window start, in every
+      system state (parked included). Read-only; fires Event 6 for weather_logger.
+    mode: queued
+    max: 2
+    trigger:
+      - platform: time
+        at: input_datetime.morning_window_start
+        id: morning
+      - platform: time
+        at: input_datetime.evening_window_start
+        id: evening
+    # NO condition block: always-on by design (see header).
+    action:
+      - variables:
+          rec_window: >-
+            {% set t = trigger.id if (trigger is defined and trigger.id is defined) else '' %}
+            {{ t if t in ['morning', 'evening'] else ('morning' if now().hour < 12 else 'evening') }}
+
+      - service: script.compute_zone_programs
+        data:
+          window: "{{ rec_window }}"
+        response_variable: snap
+
+      - event: watering_weather_snapshot
+        event_data:
+          # ---- decision snapshot (from compute_zone_programs; contract §13.3.1) ----
+          observed_at: "{{ snap.observed_at }}"
+          window_name: "{{ snap.window_name }}"
+          weather_available: "{{ snap.weather_available }}"
+          raining_now: "{{ snap.raining_now }}"
+          rain_source: "{{ snap.rain_source }}"
+          temp_high_forecast_c: "{{ snap.temp_high_forecast_c }}"
+          rain_24h_mm: "{{ snap.rain_24h_mm }}"
+          rain_72h_mm: "{{ snap.rain_72h_mm }}"
+          forecast_pop_today: "{{ snap.forecast_pop_today }}"
+          forecast_rain_today_mm: "{{ snap.forecast_rain_today_mm }}"
+          zone_decisions: "{{ snap.zone_decisions }}"
+          # ---- observational weather (not used by the decision; recorded here) ----
+          temp_c: "{{ states('sensor.brightsky_temperature') }}"
+          temp_high_yesterday_c: "{{ states('sensor.brightsky_temp_high_yesterday') }}"
+          temp_avg_high_3day_c: "{{ states('sensor.brightsky_temp_avg_high_3day') }}"
+          humidity_pct: "{{ states('sensor.brightsky_humidity') }}"
+          pressure_hpa: "{{ states('sensor.brightsky_pressure') }}"
+          cloud_cover_pct: "{{ states('sensor.brightsky_cloud_cover') }}"
+          # ---- raw JSON catch-all ----
+          raw: >-
+            {% set ns = namespace(soil={}) %}
+            {% for n in [1, 2, 3, 4] %}
+              {% set ns.soil = dict(ns.soil, **{
+                   (n | string): {
+                     'moisture': states('sensor.gw3000a_soil_moisture_' ~ n),
+                     'temp_c': states('sensor.gw3000a_soil_temperature_' ~ n),
+                     'ec_us_cm': states('sensor.gw3000a_soil_electrical_conductivity_' ~ n),
+                     'battery_v': states('sensor.gw3000a_soil_battery_' ~ n),
+                     'online': is_state('binary_sensor.wh52_soil_' ~ n ~ '_online', 'on'),
+                     'zone_tag': states('input_select.moisture_wireless_' ~ n ~ '_zone') } }) %}
+            {% endfor %}
+            {{ {
+                 'soil': ns.soil,
+                 'dew_point_c': states('sensor.brightsky_dew_point'),
+                 'wind_speed_as_reported': states('sensor.brightsky_wind_speed'),
+                 'wind_speed_unit_note': 'sensor labelled m/s; BrightSky dwd default may be km/h (unverified)',
+                 'recorder': 'weather_recording.yaml v1'
+               } }}

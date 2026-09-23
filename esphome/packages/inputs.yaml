@@ -1,0 +1,34 @@
+# -----------------------------
+# File: esphome/packages/inputs.yaml
+# Purpose: Local GPIO sensors (tank level float switches) with debouncing
+# -----------------------------
+
+binary_sensor:
+  # -------------------- Tank Level Float Switches --------------------
+  - platform: gpio
+    pin:
+      number: GPIO33
+      mode: INPUT_PULLUP
+      inverted: true
+    id: low_water_level
+    name: "Low Water Level"
+    icon: mdi:water-alert
+    device_class: problem
+    filters:
+      - delayed_on_off: 100ms
+      - delayed_on: 5s
+      - delayed_off: 30s
+
+  - platform: gpio
+    pin:
+      number: GPIO32
+      mode: INPUT_PULLUP
+      inverted: true
+    id: low_low_water_level
+    name: "Low Low Water Level"
+    icon: mdi:water-alert-outline
+    device_class: problem
+    filters:
+      - delayed_on_off: 100ms
+      - delayed_on: 5s
+      - delayed_off: 30s
